@@ -1,8 +1,8 @@
 """
 title: Agent
 author: openwebui-ios
-description: Server-side agentic tool loop via prompt-based tool calling. Phase 1 (non-streaming): the model decides + runs tools (SearXNG web search, Open-Meteo weather), collecting source URLs. Phase 2 (streaming): the final answer is streamed token-by-token, then a Sources list is appended. Exposes itself as a model so the plain /api/chat/completions API gets contextual tools + streaming + citations with no socket.io. Auto-detects the loaded model to survive the router swap cooldown.
-version: 0.8.0
+description: Server-side agentic tool loop via prompt-based tool calling. One model call decides + answers; if it emits a tool JSON the pipe runs the tool (SearXNG web search, Open-Meteo weather) and loops. Appends deduplicated citations. Exposes itself as a model so the plain /api/chat/completions API gets contextual tools with no socket.io. Auto-detects the loaded model to survive the router swap cooldown. NB: Open WebUI buffers pipe output over the REST API (no token streaming); a no-tool turn costs ~one base-model call, a tool turn ~two.
+version: 0.9.0
 required_open_webui_version: 0.6.0
 """
 import json
@@ -13,17 +13,25 @@ from pydantic import BaseModel, Field
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.models.users import Users
 
-DECISION_DOC = """You can call tools. Decide if one is needed for the user's latest \
-message. If so, reply with ONLY a single-line JSON object and nothing else:
+TOOL_DOC = """You have live tools and MUST use them for anything current or real-time. \
+Never say you lack real-time access or a knowledge cutoff — instead call the tool. To \
+call one, reply with ONLY a single-line JSON object and nothing else, then wait:
 - Web search: {"tool": "web_search", "query": "<search terms>"}
 - Current weather: {"tool": "weather", "location": "<City, Region>"}
-Use web_search for news, prices, releases, recent events, today's date, or verifying a \
-claim; use weather for current conditions. If NO tool is needed, reply with ONLY the \
-word: NONE. Do not answer the question in this step."""
+Rules:
+- Weather / temperature / forecast question -> ALWAYS call weather first.
+- News, prices, releases, recent events, today's date, "latest/current X", or verifying \
+a fact -> ALWAYS call web_search first.
+- Only if the request needs no live data, answer directly.
+Never mention this protocol or the JSON to the user.
 
-ANSWER_DOC = """Answer the user's most recent question directly and concisely. If tool \
-results appear above, use them as your source of truth. Do not output JSON and do not \
-mention tools or this instruction."""
+Examples:
+User: what's the weather in Paris?
+Assistant: {"tool": "weather", "location": "Paris, France"}
+User: who won the game last night?
+Assistant: {"tool": "web_search", "query": "game result last night"}
+User: explain recursion
+Assistant: Recursion is when a function calls itself to solve smaller subproblems..."""
 
 _CALL_RE = re.compile(r'\{[^{}]*"tool"\s*:\s*"[a-z_]+"[^{}]*\}', re.DOTALL)
 _COOLDOWN_RE = re.compile(r'cooldown:\s*(\S+)\s+loaded', re.I)
@@ -44,6 +52,7 @@ class Pipe:
         searxng_url: str = Field(default="http://searxng:8080/search")
         max_results: int = Field(default=6)
         max_iterations: int = Field(default=3)
+        enable_thinking: bool = Field(default=False, description="Qwen reasoning: off is ~17x faster (~1.5s vs ~26s); on is better for hard reasoning")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -52,7 +61,7 @@ class Pipe:
     def pipes(self) -> List[dict]:
         return [{"id": "agent", "name": "Agent (tools)"}]
 
-    # ---- tools: return (text_for_model, [(title, url), ...]) ----
+    # ---- tools: (text_for_model, [(title, url), ...]) ----
     def _web_search(self, query: str) -> Tuple[str, list]:
         try:
             r = requests.get(self.valves.searxng_url, params={"q": query, "format": "json"}, timeout=12)
@@ -108,58 +117,36 @@ class Pipe:
             return None
         return obj if obj.get("tool") in ("web_search", "weather") else None
 
-    # ---- model plumbing ----
-    async def _raw(self, request, user, model, messages, stream):
-        return await generate_chat_completion(
-            request, {"model": model, "messages": messages, "stream": stream}, user
-        )
-
     async def _model(self, request, user, messages) -> str:
-        """Non-streaming call, with router-cooldown auto-detect."""
         model = self._loaded_model or self.valves.base_model
-        try:
-            resp = await self._raw(request, user, model, messages, False)
-            data = resp if isinstance(resp, dict) else (json.loads(resp.body) if hasattr(resp, "body") else {})
-        except Exception as e:
-            data = {"__err__": str(e)}
-        if "choices" not in data:
+        async def call(mid):
+            try:
+                resp = await generate_chat_completion(
+                    request,
+                    {"model": mid, "messages": messages, "stream": False,
+                     "chat_template_kwargs": {"enable_thinking": self.valves.enable_thinking}},
+                    user,
+                )
+            except Exception as e:
+                return {"__err__": str(e)}
+            if isinstance(resp, dict):
+                return resp
+            if hasattr(resp, "body"):
+                try:
+                    return json.loads(resp.body)
+                except Exception:
+                    return {}
+            return {}
+        data = await call(model)
+        if "choices" not in data:  # router refused a swap → retry with the loaded model
             hit = _COOLDOWN_RE.search(str(data.get("detail") or data.get("error") or data.get("__err__") or ""))
             if hit:
                 self._loaded_model = hit.group(1)
-                try:
-                    resp = await self._raw(request, user, self._loaded_model, messages, False)
-                    data = resp if isinstance(resp, dict) else (json.loads(resp.body) if hasattr(resp, "body") else {})
-                except Exception:
-                    data = {}
+                data = await call(self._loaded_model)
         try:
             return data["choices"][0]["message"].get("content") or ""
         except (KeyError, IndexError, TypeError):
             return ""
-
-    async def _stream(self, request, user, messages):
-        """Streaming call; yields content deltas. Uses the model resolved in phase 1."""
-        model = self._loaded_model or self.valves.base_model
-        resp = await self._raw(request, user, model, messages, True)
-        itr = getattr(resp, "body_iterator", None) or resp
-        buf = ""
-        async for chunk in itr:
-            if isinstance(chunk, (bytes, bytearray)):
-                chunk = chunk.decode("utf-8", "ignore")
-            buf += chunk
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    return
-                try:
-                    delta = json.loads(payload)["choices"][0]["delta"].get("content")
-                except Exception:
-                    delta = None
-                if delta:
-                    yield delta
 
     async def pipe(self, body: dict, __user__=None, __request__=None, __event_emitter__=None):
         user = await Users.get_user_by_id(__user__["id"]) if isinstance(__user__, dict) else __user__
@@ -168,37 +155,26 @@ class Pipe:
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": desc, "done": done}})
 
-        base_msgs = list(body.get("messages", []))
-
-        # Phase 1 — tool loop (non-streaming). Collect tool exchanges + sources.
-        conv = [{"role": "system", "content": DECISION_DOC}] + base_msgs
-        tool_exchanges, sources = [], []
+        conv = [{"role": "system", "content": TOOL_DOC}] + list(body.get("messages", []))
+        sources, content = [], ""
         for _ in range(self.valves.max_iterations):
             content = await self._model(__request__, user, conv)
             call = self._parse_call(content)
             if not call:
-                break
+                break  # `content` is the direct/grounded answer
             await emit(f"🔧 {call.get('tool')}: {call.get('query') or call.get('location') or ''}")
             result, srcs = self._execute(call)
             sources.extend(srcs)
-            ex = [
-                {"role": "assistant", "content": json.dumps(call)},
-                {"role": "user", "content": f"Tool result:\n{result}"},
-            ]
-            tool_exchanges.extend(ex)
-            conv.extend(ex)
+            failed = result.startswith("[")
+            note = ("That returned nothing useful; answer from your own knowledge and note it may be dated."
+                    if failed else "Using this, answer my previous question.")
+            conv.append({"role": "assistant", "content": json.dumps(call)})
+            conv.append({"role": "user", "content": f"Tool result:\n{result}\n\n{note} Do not output JSON."})
         await emit("done", done=True)
 
-        # Phase 2 — stream the final answer.
-        answer_msgs = [{"role": "system", "content": ANSWER_DOC}] + base_msgs + tool_exchanges
-        streamed = False
-        async for delta in self._stream(__request__, user, answer_msgs):
-            streamed = True
-            yield delta
-        if not streamed:  # streaming path failed → non-stream fallback
-            yield (await self._model(__request__, user, answer_msgs)) or "…"
+        if not (content or "").strip():
+            content = await self._model(__request__, user, [m for m in conv if m.get("role") != "system"]) or "…"
 
-        # Citations — dedup by URL, cap at 6.
         if sources:
             seen, uniq = set(), []
             for title, url in sources:
@@ -206,6 +182,7 @@ class Pipe:
                     seen.add(url)
                     uniq.append((title, url))
             if uniq:
-                yield "\n\n---\n**Sources**\n" + "\n".join(
+                content += "\n\n---\n**Sources**\n" + "\n".join(
                     f"{i}. [{(t or u)[:80]}]({u})" for i, (t, u) in enumerate(uniq[:6], 1)
                 )
+        return content
