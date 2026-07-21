@@ -237,10 +237,22 @@ class Pipe:
 
         # Hard fallback: if we fetched valid weather but the model still hedged
         # (no temperature in the reply, or a "can't/couldn't/unable" disclaimer),
-        # return the fetched data directly — it's already human-readable.
-        if weather_result and ("°" not in content
-                or re.search(r"\b(can'?t|cannot|couldn'?t|unable|do(?:n'?t| not) have|no access)\b", content, re.I)):
-            content = weather_result
+        # reformat the fetched data to the user's request with a fresh call (a
+        # rewrite of provided data doesn't trip the refusal prior); if that also
+        # hedges, return the raw data directly — reliability over prettiness.
+        _HEDGE = r"\b(can'?t|cannot|couldn'?t|unable|do(?:n'?t| not) have|no access)\b"
+        if weather_result and (not re.search(r"\d", content)
+                or re.search(_HEDGE, content, re.I)):
+            reformatted = await self._model(__request__, user, [
+                {"role": "system", "content": "Rewrite the given weather data to answer the user's "
+                 "request in their requested style/length. Output only the answer — no disclaimers, "
+                 "no mention of data sources or access."},
+                {"role": "user", "content": f"User asked: {last_user}\n\nWeather data: {weather_result}"},
+            ])
+            if re.search(r"\d", reformatted) and not re.search(_HEDGE, reformatted, re.I):
+                content = reformatted
+            else:
+                content = weather_result
 
         if sources:
             seen, uniq = set(), []
