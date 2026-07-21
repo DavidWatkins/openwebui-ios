@@ -72,7 +72,12 @@ class Pipe:
         self._loaded_model: Optional[str] = None
 
     def pipes(self) -> List[dict]:
-        return [{"id": "agent", "name": "Agent (tools)"}]
+        # Two variants surface as models in the picker: pick "thinking" per chat
+        # for deep reasoning (slower), or the fast default for everything else.
+        return [
+            {"id": "agent", "name": "Agent (tools)"},
+            {"id": "agent_think", "name": "Agent (tools, thinking)"},
+        ]
 
     # ---- tools: (text_for_model, [(title, url), ...]) ----
     def _web_search(self, query: str) -> Tuple[str, list]:
@@ -187,6 +192,8 @@ class Pipe:
 
     async def pipe(self, body: dict, __user__=None, __request__=None, __event_emitter__=None):
         user = await Users.get_user_by_id(__user__["id"]) if isinstance(__user__, dict) else __user__
+        # "Agent (tools, thinking)" variant → reason on the final answer.
+        turn_think = str(body.get("model", "")).endswith("agent_think")
 
         async def emit(desc, done=False):
             if __event_emitter__:
@@ -218,7 +225,7 @@ class Pipe:
                     "Do not output JSON."})
 
         for _ in range(self.valves.max_iterations):
-            content = await self._model(__request__, user, conv)
+            content = await self._model(__request__, user, conv, think=turn_think)
             call = self._parse_call(content)
             if not call:
                 break  # `content` is the direct/grounded answer
@@ -233,7 +240,7 @@ class Pipe:
         await emit("done", done=True)
 
         if not (content or "").strip():
-            content = await self._model(__request__, user, [m for m in conv if m.get("role") != "system"]) or "…"
+            content = await self._model(__request__, user, [m for m in conv if m.get("role") != "system"], think=turn_think) or "…"
 
         # Hard fallback: if we fetched valid weather but the model still hedged
         # (no temperature in the reply, or a "can't/couldn't/unable" disclaimer),
