@@ -191,6 +191,21 @@ public actor OWSocket {
                     if (block["type"] as? String) == "reasoning" { think += joined }
                     else { answer += joined }
                 }
+                // Defensive: if the answer still carries literal <think> tags
+                // (pipe re-attaches reasoning; some flows don't convert them),
+                // lift them into the reasoning channel instead of the reply.
+                if think.isEmpty {
+                    if answer.contains("</think>") {
+                        let split = OWReasoning.split(answer)
+                        answer = split.content
+                        think = split.reasoning ?? ""
+                    } else if let open = answer.range(of: "<think>") {
+                        // Still streaming the thinking (no closing tag yet) — keep
+                        // it in the reasoning channel so it doesn't flash as the reply.
+                        think = String(answer[open.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        answer = String(answer[..<open.lowerBound])
+                    }
+                }
                 if !answer.isEmpty { text = answer }
                 if !think.isEmpty { reasoning = think }
             }

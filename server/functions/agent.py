@@ -2,7 +2,7 @@
 title: Agent
 author: openwebui-ios
 description: Server-side agentic tool loop via prompt-based tool calling. One model call decides + answers; if it emits a tool JSON the pipe runs the tool (SearXNG web search, Open-Meteo weather) and loops. Appends deduplicated citations. Exposes itself as a model so the plain /api/chat/completions API gets contextual tools with no socket.io. Auto-detects the loaded model to survive the router swap cooldown. NB: Open WebUI buffers pipe output over the REST API (no token streaming); a no-tool turn costs ~one base-model call, a tool turn ~two.
-version: 0.9.0
+version: 0.10.0
 required_open_webui_version: 0.6.0
 """
 import json
@@ -145,11 +145,11 @@ class Pipe:
         return obj if obj.get("tool") in ("web_search", "weather") else None
 
     async def _extract_location(self, request, user, text: str) -> str:
-        out = await self._model(request, user, [
+        out, _ = await self._model(request, user, [
             {"role": "system", "content": 'Extract the place the user is asking about. '
              'Reply with ONLY JSON: {"location": "City, Region"} — or {"location": ""} if none.'},
             {"role": "user", "content": text},
-        ])
+        ], think=False)
         m = _LOC_RE.search(out or "")
         if not m:
             return ""
@@ -158,19 +158,42 @@ class Pipe:
         except Exception:
             return ""
 
-    async def _model(self, request, user, messages, think: Optional[bool] = None) -> str:
+    async def _model(self, request, user, messages,
+                     think: Optional[bool] = None) -> Tuple[str, str]:
+        """Returns (content, reasoning). When thinking is on we stream internally
+        because Open WebUI's non-streaming response drops `reasoning_content` —
+        only the SSE deltas carry it — and we want the thinking for auditing."""
         model = self._loaded_model or self.valves.base_model
         thinking = self.valves.enable_thinking if think is None else think
         async def call(mid):
+            payload = {"model": mid, "messages": messages, "stream": bool(thinking),
+                       "chat_template_kwargs": {"enable_thinking": thinking}}
             try:
-                resp = await generate_chat_completion(
-                    request,
-                    {"model": mid, "messages": messages, "stream": False,
-                     "chat_template_kwargs": {"enable_thinking": thinking}},
-                    user,
-                )
+                resp = await generate_chat_completion(request, payload, user)
             except Exception as e:
                 return {"__err__": str(e)}
+            # Streaming (thinking on): aggregate content + reasoning from SSE deltas.
+            if hasattr(resp, "body_iterator"):
+                content, reasoning = "", ""
+                async for chunk in resp.body_iterator:
+                    if isinstance(chunk, (bytes, bytearray)):
+                        chunk = chunk.decode("utf-8", "ignore")
+                    for line in str(chunk).splitlines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        p = line[5:].strip()
+                        if p == "[DONE]":
+                            continue
+                        try:
+                            d = json.loads(p)
+                        except Exception:
+                            continue
+                        delta = (d.get("choices") or [{}])[0].get("delta", {}) or {}
+                        reasoning += delta.get("reasoning_content") or delta.get("reasoning") or ""
+                        content += delta.get("content") or ""
+                return {"__stream__": True, "content": content, "reasoning": reasoning}
+            # Non-streaming (thinking off): JSONResponse or dict.
             if isinstance(resp, dict):
                 return resp
             if hasattr(resp, "body"):
@@ -180,15 +203,18 @@ class Pipe:
                     return {}
             return {}
         data = await call(model)
-        if "choices" not in data:  # router refused a swap → retry with the loaded model
+        if "choices" not in data and "__stream__" not in data:  # router refused → retry loaded model
             hit = _COOLDOWN_RE.search(str(data.get("detail") or data.get("error") or data.get("__err__") or ""))
             if hit:
                 self._loaded_model = hit.group(1)
                 data = await call(self._loaded_model)
+        if data.get("__stream__"):
+            return data.get("content") or "", data.get("reasoning") or ""
         try:
-            return data["choices"][0]["message"].get("content") or ""
+            msg = data["choices"][0]["message"]
+            return (msg.get("content") or ""), (msg.get("reasoning_content") or "")
         except (KeyError, IndexError, TypeError):
-            return ""
+            return "", ""
 
     async def pipe(self, body: dict, __user__=None, __request__=None, __event_emitter__=None):
         user = await Users.get_user_by_id(__user__["id"]) if isinstance(__user__, dict) else __user__
@@ -202,6 +228,7 @@ class Pipe:
         base_msgs = list(body.get("messages", []))
         conv = [{"role": "system", "content": TOOL_DOC}] + base_msgs
         sources, content = [], ""
+        reasonings = []  # thinking from each answer-generating call, surfaced for auditing
 
         # Deterministic weather routing: with thinking off, Qwen's "I can't do
         # real-time weather" prior makes it refuse the weather tool. An extraction
@@ -225,7 +252,9 @@ class Pipe:
                     "Do not output JSON."})
 
         for _ in range(self.valves.max_iterations):
-            content = await self._model(__request__, user, conv, think=turn_think)
+            content, reasoning = await self._model(__request__, user, conv, think=turn_think)
+            if reasoning:
+                reasonings.append(reasoning)
             call = self._parse_call(content)
             if not call:
                 break  # `content` is the direct/grounded answer
@@ -240,7 +269,10 @@ class Pipe:
         await emit("done", done=True)
 
         if not (content or "").strip():
-            content = await self._model(__request__, user, [m for m in conv if m.get("role") != "system"], think=turn_think) or "…"
+            content, reasoning = await self._model(__request__, user, [m for m in conv if m.get("role") != "system"], think=turn_think)
+            content = content or "…"
+            if reasoning:
+                reasonings.append(reasoning)
 
         # Hard fallback: if we fetched valid weather but the model still hedged
         # (no temperature in the reply, or a "can't/couldn't/unable" disclaimer),
@@ -250,7 +282,7 @@ class Pipe:
         _HEDGE = r"\b(can'?t|cannot|couldn'?t|unable|do(?:n'?t| not) have|no access)\b"
         if weather_result and (not re.search(r"\d", content)
                 or re.search(_HEDGE, content, re.I)):
-            reformatted = await self._model(__request__, user, [
+            reformatted, _ = await self._model(__request__, user, [
                 {"role": "system", "content": "Rewrite the given weather data to answer the user's "
                  "request in their requested style/length. Output only the answer — no disclaimers, "
                  "no mention of data sources or access."},
@@ -271,4 +303,13 @@ class Pipe:
                 content += "\n\n---\n**Sources**\n" + "\n".join(
                     f"{i}. [{(t or u)[:80]}]({u})" for i, (t, u) in enumerate(uniq[:6], 1)
                 )
+
+        # Surface the model's thinking for auditing. The pipe strips reasoning from
+        # each internal call (the base model puts it in `reasoning_content`), so we
+        # re-attach it as a leading <think> block; Open WebUI / the app render that
+        # as the collapsible thinking disclosure above the reply.
+        if reasonings:
+            combined = "\n\n---\n\n".join(r.strip() for r in reasonings if r.strip())
+            if combined:
+                content = f"<think>\n{combined}\n</think>\n\n{content}"
         return content

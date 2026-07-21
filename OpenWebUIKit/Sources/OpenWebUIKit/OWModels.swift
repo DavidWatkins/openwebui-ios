@@ -109,6 +109,28 @@ public enum OWRole: String, Codable, Sendable {
     }
 }
 
+/// Splits inline `<think>…</think>` thinking out of assistant text. Open WebUI
+/// usually separates reasoning into its own channel, but the agent pipe re-attaches
+/// it as a leading `<think>` block for auditing, and some flows pass those tags
+/// through literally — so we defensively lift them into a separate disclosure
+/// rather than showing them as the reply. Also handles the Qwen-template case where
+/// the opening `<think>` was in the prompt, leaving only a trailing `</think>`.
+enum OWReasoning {
+    static func split(_ text: String) -> (content: String, reasoning: String?) {
+        guard let close = text.range(of: "</think>") else { return (text, nil) }
+        let head = String(text[..<close.lowerBound])
+        let tail = String(text[close.upperBound...])
+        let think: String
+        if let open = head.range(of: "<think>") {
+            think = String(head[open.upperBound...])
+        } else {
+            think = head   // unclosed opening tag (template injected it)
+        }
+        let r = think.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (tail.trimmingCharacters(in: .whitespacesAndNewlines), r.isEmpty ? nil : r)
+    }
+}
+
 /// One element of a multimodal `content` array
 /// (e.g. [{type:"text", text:"…"}, {type:"image_url", image_url:{url:"data:…"}}]).
 struct OWContentPart: Decodable {
@@ -210,12 +232,21 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
         timestamp = try? c.decode(Double.self, forKey: .timestamp)
         parentId = try? c.decodeIfPresent(String.self, forKey: .parentId)
 
+        // Any inline <think> tags (agent pipe re-attaches reasoning this way, and
+        // some flows pass them through literally) belong in the disclosure, not the reply.
+        var inlineReasoning: String?
+        if content.contains("</think>") {
+            let split = OWReasoning.split(content)
+            content = split.content
+            inlineReasoning = split.reasoning
+        }
+
         // Open WebUI is inconsistent about which key holds thinking text, and the
         // streaming delta uses both too (see ChatCompletionsClient). Accept either;
         // treat an empty string as absent so the disclosure doesn't render blank.
         let think = (try? c.decodeIfPresent(String.self, forKey: .reasoning))
             ?? (try? c.decodeIfPresent(String.self, forKey: .reasoning_content))
-            ?? outputReasoning
+            ?? outputReasoning ?? inlineReasoning
         reasoning = (think?.isEmpty == false) ? think : nil
     }
 
