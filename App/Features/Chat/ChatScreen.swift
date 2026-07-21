@@ -134,6 +134,15 @@ struct ChatScreen: View {
                         )
                         .id(msg.id)
                     }
+                    if let status = vm.toolStatus {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text(status).font(.ody(size: 12, design: .monospaced)).foregroundStyle(theme.secondaryText)
+                            Spacer()
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(.opacity)
+                    }
                 }
                 .padding(.horizontal, 14).padding(.vertical, 16)
                 Color.clear.frame(height: 1).id("bottom")
@@ -142,6 +151,7 @@ struct ChatScreen: View {
             .refreshable { await vm.reloadHistory() }
             .onChange(of: vm.messages.last?.content) { _, _ in scrollToBottom(proxy) }
             .onChange(of: vm.messages.count) { _, _ in scrollToBottom(proxy) }
+            .onChange(of: vm.toolStatus) { _, _ in scrollToBottom(proxy) }
         }
     }
 
@@ -167,15 +177,6 @@ struct ChatScreen: View {
     private var composer: some View {
         VStack(spacing: 8) {
             if vm.isStreaming { Divider().overlay(theme.border) }
-            if let status = vm.toolStatus {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text(status).font(.ody(size: 11, design: .monospaced)).foregroundStyle(theme.secondaryText)
-                    Spacer()
-                }
-                .padding(.horizontal, 14)
-                .transition(.opacity)
-            }
             HStack(spacing: 8) {
                 featuresMenu
                 toggleChip(system: "photo.artframe", label: "Gerar imagem", on: $vm.imageMode)

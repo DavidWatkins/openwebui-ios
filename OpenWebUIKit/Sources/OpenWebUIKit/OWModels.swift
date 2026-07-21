@@ -155,7 +155,16 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, role, content, model, timestamp, files, parentId
-        case reasoning, reasoning_content
+        case reasoning, reasoning_content, output
+    }
+
+    /// One block of the socket/pipe `output` array Open WebUI persists instead of
+    /// a plain `content` string: `{ type: "message" | "reasoning", content: [...] }`.
+    /// Server chats replied to over the socket store their text here and leave
+    /// `content` empty, so we reconstruct both the answer and the thinking from it.
+    private struct OWOutputBlock: Decodable {
+        var type: String?
+        var content: [OWContentPart]?
     }
 
     public init(from decoder: Decoder) throws {
@@ -183,6 +192,20 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
         imageURLs = imgs
         documents = docs
 
+        // Socket/pipe replies persist as an `output` block array with `content`
+        // left empty. Rebuild the answer from `message` blocks and the thinking
+        // from `reasoning` blocks — without this, server chats look empty on reload.
+        var outputReasoning: String?
+        if content.isEmpty, let blocks = try? c.decode([OWOutputBlock].self, forKey: .output) {
+            var answer = "", reason = ""
+            for b in blocks {
+                let joined = (b.content ?? []).compactMap(\.text).joined()
+                if b.type == "reasoning" { reason += joined } else { answer += joined }
+            }
+            if !answer.isEmpty { content = answer }
+            if !reason.isEmpty { outputReasoning = reason }
+        }
+
         model = try? c.decodeIfPresent(String.self, forKey: .model)
         timestamp = try? c.decode(Double.self, forKey: .timestamp)
         parentId = try? c.decodeIfPresent(String.self, forKey: .parentId)
@@ -192,7 +215,7 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
         // treat an empty string as absent so the disclosure doesn't render blank.
         let think = (try? c.decodeIfPresent(String.self, forKey: .reasoning))
             ?? (try? c.decodeIfPresent(String.self, forKey: .reasoning_content))
-            ?? nil
+            ?? outputReasoning
         reasoning = (think?.isEmpty == false) ? think : nil
     }
 

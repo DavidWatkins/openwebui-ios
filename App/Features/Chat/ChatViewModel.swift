@@ -210,6 +210,7 @@ final class ChatViewModel: ObservableObject {
         let assistant = OWMessage(role: .assistant, content: "", model: model)
         messages.append(assistant)
         isStreaming = true
+        toolStatus = nil
 
         // Context = everything except the empty assistant placeholder we stream into.
         var convo = messages.dropLast().map { OWChatMessageInput($0) }
@@ -264,6 +265,8 @@ final class ChatViewModel: ObservableObject {
             case .content(let full):
                 sawContent = true
                 setContent(assistant.id, full)   // cumulative → replace, not append
+            case .reasoning(let full):
+                setReasoning(assistant.id, full) // cumulative → replace, not append
             case .status(let s):
                 toolStatus = s
             case .done:
@@ -450,5 +453,9 @@ final class ChatViewModel: ObservableObject {
     }
     private func setContent(_ id: String, _ text: String) {
         if let i = index(of: id) { messages[i].content = text }
+    }
+    /// Cumulative reasoning (socket sends the full thinking each tick → replace).
+    private func setReasoning(_ id: String, _ text: String) {
+        if let i = index(of: id) { messages[i].reasoning = text }
     }
 }

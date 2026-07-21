@@ -21,6 +21,9 @@ public actor OWSocket {
         /// For `chat:completion` — the assistant's CUMULATIVE output text so far
         /// (Open WebUI sends the full text each tick, so replace, don't append).
         public let text: String?
+        /// For `chat:completion` — the CUMULATIVE reasoning/thinking text (from the
+        /// `reasoning` output block), kept separate so it doesn't leak into the reply.
+        public let reasoning: String?
         /// For `status` — the tool-progress description (e.g. "🔧 weather: Boston").
         public let statusText: String?
         /// True on the final `chat:completion` (`done`) or a `chat:active:false`.
@@ -170,17 +173,26 @@ public actor OWSocket {
         let data = inner["data"] as? [String: Any] ?? [:]
 
         var text: String?
+        var reasoning: String?
         var statusText: String?
         var done = false
         switch type {
         case "chat:completion":
-            // Cumulative text lives at data.output[].content[].text (output_text).
+            // `data.output` is an array of typed blocks. A `reasoning` block holds
+            // the model's thinking (start_tag "<think>"); a `message` block holds
+            // the answer. Both carry text at content[].output_text and are
+            // CUMULATIVE. Keep them apart so thinking never leaks into the reply.
             if let output = data["output"] as? [[String: Any]] {
-                text = output.compactMap { msg -> String? in
-                    (msg["content"] as? [[String: Any]])?
+                var answer = "", think = ""
+                for block in output {
+                    let joined = (block["content"] as? [[String: Any]])?
                         .compactMap { ($0["type"] as? String) == "output_text" ? $0["text"] as? String : nil }
-                        .joined()
-                }.joined()
+                        .joined() ?? ""
+                    if (block["type"] as? String) == "reasoning" { think += joined }
+                    else { answer += joined }
+                }
+                if !answer.isEmpty { text = answer }
+                if !think.isEmpty { reasoning = think }
             }
             done = (data["done"] as? Bool) ?? false
         case "status":
@@ -193,7 +205,8 @@ public actor OWSocket {
         }
         onEvent?(Event(chatID: payload["chat_id"] as? String ?? "",
                        messageID: payload["message_id"] as? String ?? "",
-                       type: type, text: text, statusText: statusText, done: done))
+                       type: type, text: text, reasoning: reasoning,
+                       statusText: statusText, done: done))
     }
 
     // MARK: - Low-level

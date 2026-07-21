@@ -4,8 +4,9 @@ import Foundation
 /// content is CUMULATIVE — Open WebUI resends the full text each tick — so
 /// `.content` should REPLACE the assistant message, not append.
 public enum OWSocketUpdate: Sendable {
-    case content(String)   // full assistant text so far
-    case status(String)    // tool-progress description (e.g. "🔧 weather: Boston")
+    case content(String)    // full assistant text so far
+    case reasoning(String)  // full thinking text so far (separate disclosure)
+    case status(String)     // tool-progress description (e.g. "🔧 weather: Boston")
     case done
     case error(String)
 }
@@ -37,10 +38,15 @@ extension OpenWebUIClient {
                         guard ev.messageID == messageID else { return }
                         switch ev.type {
                         case "chat:completion":
+                            if let r = ev.reasoning, !r.isEmpty { continuation.yield(.reasoning(r)) }
                             if let t = ev.text, !t.isEmpty { continuation.yield(.content(t)) }
                             if ev.done { continuation.yield(.done); continuation.finish() }
                         case "status":
-                            if let s = ev.statusText { continuation.yield(.status(s)) }
+                            // Skip the terminal "done" marker — it's an end signal,
+                            // not a tool the user should see running.
+                            if let s = ev.statusText, !ev.done, s != "done" {
+                                continuation.yield(.status(s))
+                            }
                         case "chat:active":
                             if ev.done { continuation.yield(.done); continuation.finish() }
                         default:
