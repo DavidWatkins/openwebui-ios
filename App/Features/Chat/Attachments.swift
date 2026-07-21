@@ -2,6 +2,7 @@ import SwiftUI
 #if os(iOS)
 import UIKit
 #endif
+import ImageIO
 import UniformTypeIdentifiers
 import OpenWebUIKit
 
@@ -32,11 +33,37 @@ enum AttachImage {
         #endif
     }
 
-    /// Decode a `data:` URL into a platform image.
+    /// Decode a `data:` URL into a platform image (full resolution — use only
+    /// where the full image is actually needed, e.g. the zoomable viewer).
     static func decode(_ url: String) -> OWPlatformImage? {
-        guard url.hasPrefix("data:"), let comma = url.range(of: ",") else { return nil }
-        guard let d = Data(base64Encoded: String(url[comma.upperBound...])) else { return nil }
+        guard let d = dataURLBytes(url) else { return nil }
         return OWPlatformImage(data: d)
+    }
+
+    /// Raw bytes of a `data:` URL (base64 → Data), or nil if it's a server path.
+    static func dataURLBytes(_ url: String) -> Data? {
+        guard url.hasPrefix("data:"), let comma = url.range(of: ",") else { return nil }
+        return Data(base64Encoded: String(url[comma.upperBound...]))
+    }
+
+    /// Decode `data` directly to a downsampled thumbnail via ImageIO — never
+    /// materializes the full-resolution bitmap, so a 1024px source shown at 56px
+    /// costs ~0.5MB instead of ~4MB. This is the memory-critical path: thumbnails
+    /// in the chat used to decode full-res on every render.
+    static func thumbnail(from data: Data, maxPixel: CGFloat) -> OWPlatformImage? {
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixel),
+        ]
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        #if os(macOS)
+        return NSImage(cgImage: cg, size: .zero)
+        #else
+        return UIImage(cgImage: cg)
+        #endif
     }
 }
 
@@ -47,24 +74,31 @@ struct AttachmentThumb: View {
     var size: CGFloat = 56
     var client: OpenWebUIClient? = nil
     @Environment(\.theme) private var theme
+    @Environment(\.displayScale) private var displayScale
     @State private var loaded: OWPlatformImage?
 
     var body: some View {
         Group {
-            if let img = AttachImage.decode(url) ?? loaded {
+            if let img = loaded {
                 Image(platformImage: img).resizable().aspectRatio(contentMode: .fill)
             } else {
                 ZStack { theme.panel; ProgressView().controlSize(.small) }
-                    .task(id: url) {
-                        if AttachImage.decode(url) == nil, let c = client,
-                           let d = await c.imageData(path: url), let i = OWPlatformImage(data: d) {
-                            loaded = i
-                        }
-                    }
             }
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        // Decode ONCE per url, downsampled to the display size — not in `body`
+        // (which re-ran on every render, and on every token during streaming,
+        // rebuilding full-res bitmaps → memory blowup). The ImageIO thumbnail is
+        // cheap because it never materializes the full-resolution image.
+        .task(id: url) {
+            let maxPixel = size * displayScale * 2   // headroom for .fill scaling
+            if let d = AttachImage.dataURLBytes(url) {
+                loaded = AttachImage.thumbnail(from: d, maxPixel: maxPixel)
+            } else if let c = client, let d = await c.imageData(path: url) {
+                loaded = AttachImage.thumbnail(from: d, maxPixel: maxPixel)
+            }
+        }
     }
 }
 
@@ -251,13 +285,14 @@ struct ImageViewerView: View {
     @State private var saved = false
     @State private var scale: CGFloat = 1
 
-    private var uiImage: OWPlatformImage? { AttachImage.decode(url) ?? cachedRemote }
-    @State private var cachedRemote: OWPlatformImage?
+    // Decoded once in `.task`, never in `body` — otherwise every pinch-zoom
+    // frame (scale changes) re-decoded the full-resolution image.
+    @State private var image: OWPlatformImage?
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if let img = uiImage {
+            if let img = image {
                 Image(platformImage: img)
                     .resizable().scaledToFit()
                     .scaleEffect(scale)
@@ -272,7 +307,7 @@ struct ImageViewerView: View {
                         Image(systemName: "xmark.circle.fill").font(.title).foregroundStyle(.white.opacity(0.85))
                     }
                     Spacer()
-                    if uiImage != nil {
+                    if image != nil {
                         Button { save() } label: {
                             Image(systemName: saved ? "checkmark.circle.fill" : "square.and.arrow.down")
                                 .font(.title2).foregroundStyle(.white.opacity(0.85))
@@ -283,17 +318,19 @@ struct ImageViewerView: View {
                 Spacer()
             }
         }
-        .task {
-            // Server (non-data) URLs need the Bearer header — use the client.
-            if AttachImage.decode(url) == nil, let c = client,
-               let d = await c.imageData(path: url) {
-                cachedRemote = OWPlatformImage(data: d)
+        .task(id: url) {
+            // Full-resolution decode (this is the zoomable viewer), but only once.
+            if let d = AttachImage.dataURLBytes(url) {
+                image = OWPlatformImage(data: d)
+            } else if let c = client, let d = await c.imageData(path: url) {
+                // Server (non-data) URLs need the Bearer header — use the client.
+                image = OWPlatformImage(data: d)
             }
         }
     }
 
     private func save() {
-        guard let img = uiImage else { return }
+        guard let img = image else { return }
         owSaveImage(img)
         saved = true
     }

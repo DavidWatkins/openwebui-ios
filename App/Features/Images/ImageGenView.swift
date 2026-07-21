@@ -223,7 +223,7 @@ struct ImageGenView: View {
                         ForEach(store.llmModels) { m in Button(m.shortName) { store.helperModel = m.id } }
                     } label: {
                         HStack(spacing: 3) {
-                            Text(store.llmModels.first { $0.id == store.helperModel }?.shortName ?? "Modelo")
+                            Text(store.llmModels.first { $0.id == store.helperModel }?.shortName ?? L("Modelo"))
                                 .font(.ody(size: 10, design: .monospaced)).lineLimit(1)
                             Image(systemName: "chevron.up.chevron.down").font(.system(size: 8))
                         }.foregroundStyle(theme.accent).frame(maxWidth: 130, alignment: .trailing)

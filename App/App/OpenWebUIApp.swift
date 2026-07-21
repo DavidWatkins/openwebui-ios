@@ -23,11 +23,19 @@ struct OpenWebUIApp: App {
                 .environment(\.layoutDirection, lang.layoutDirection)   // RTL for ar/fa/ur/ps
                 .preferredColorScheme(themes.theme.isDark ? .dark : .light)
                 .tint(themes.theme.accent)
-                // Font family is read by the non-View `Font.ody` helper via a
-                // global; bump identity so the whole tree re-renders on change.
-                // The language code is folded in so a language switch rebuilds
-                // the tree and re-resolves every localized string.
-                .id("\(themes.fontFamily)#\(lang.current.rawValue)")
+                // Keyed on the language code so a language switch rebuilds the
+                // tree and re-resolves every `L(_:)`-computed string (those read a
+                // global bundle SwiftUI can't observe). Language changes are rare
+                // and happen from a dedicated screen, so the rebuild is fine there.
+                //
+                // Font is deliberately NOT in this id: it used to be, but changing
+                // font then reset the whole tree's identity and tore down whatever
+                // was on screen — including the theme/appearance picker mid-use
+                // (the "picking a font exits the chooser" bug). Font still updates
+                // live on the active screen via ThemeStore observation; a theme
+                // switch (which also sets the font) refreshes everything through
+                // the `\.theme` environment.
+                .id(lang.current.rawValue)
                 #if os(macOS)
                 // The app draws its own controls; suppress AppKit's default
                 // bordered chrome, and give the window desktop-sized bounds.

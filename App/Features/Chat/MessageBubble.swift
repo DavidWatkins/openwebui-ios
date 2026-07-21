@@ -9,16 +9,24 @@ struct MessageBubble: View {
     @Environment(\.theme) private var theme
     @ObservedObject private var speech = SpeechManager.shared
     @State private var viewer: ViewerImage?
+    /// nil = follow the automatic behaviour (open while thinking, closed once the
+    /// reply starts). Once the user taps, their choice wins for the rest of the view.
+    @State private var reasoningOverride: Bool?
 
     struct ViewerImage: Identifiable { let id = UUID(); let url: String }
 
     private var isUser: Bool { message.role == .user }
+
+    /// The model is thinking when reasoning is arriving but no reply text has yet.
+    private var isThinking: Bool { isStreaming && message.content.isEmpty }
+    private var reasoningExpanded: Bool { reasoningOverride ?? isThinking }
 
     var body: some View {
         HStack(alignment: .top) {
             if isUser { Spacer(minLength: 36) }
             VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
                 if !isUser { header }
+                if !isUser, let reasoning = message.reasoning { reasoningView(reasoning) }
                 if !message.imageURLs.isEmpty { imagesView }
                 if !message.documents.isEmpty { documentsView }
                 if !message.content.isEmpty || (message.imageURLs.isEmpty && message.documents.isEmpty) { bubble }
@@ -47,6 +55,50 @@ struct MessageBubble: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+
+    /// Collapsible extended-thinking block, shown above the reply.
+    private func reasoningView(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { reasoningOverride = !reasoningExpanded }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.right")
+                        .font(.ody(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(reasoningExpanded ? 90 : 0))
+                    if isThinking {
+                        Text("Pensando…")
+                    } else {
+                        Text("Raciocínio")
+                    }
+                }
+                .font(.ody(size: 11, design: .monospaced))
+                .foregroundStyle(theme.secondaryText)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if reasoningExpanded && !text.isEmpty {
+                // While it streams we show only the last few lines so a long think
+                // doesn't shove the reply off-screen — `.head` truncation keeps the
+                // newest text visible without any scroll plumbing. Once the user
+                // opens it themselves they get the whole thing.
+                let windowed = isThinking && reasoningOverride == nil
+                Text(text)
+                    .font(.ody(size: 12, design: .monospaced))
+                    .foregroundStyle(theme.secondaryText)
+                    .lineLimit(windowed ? 8 : nil)
+                    .truncationMode(.head)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 10)
+                    .overlay(alignment: .leading) {
+                        Rectangle().fill(theme.border.opacity(0.6)).frame(width: 2)
+                    }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var imagesView: some View {

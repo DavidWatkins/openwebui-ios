@@ -22,8 +22,8 @@ struct ChatScreen: View {
     @State private var comingSoon: String?
     @State private var showVoice = false
 
-    init(app: AppState, chat: OWChatSummary?, temporary: Bool = false, onChanged: @escaping () -> Void) {
-        let model = app.makeChatViewModel(chat: chat, temporary: temporary)
+    init(app: AppState, chat: OWChatSummary?, mode: ChatMode? = nil, onChanged: @escaping () -> Void) {
+        let model = app.makeChatViewModel(chat: chat, mode: mode)
         model.onChanged = onChanged
         _vm = StateObject(wrappedValue: model)
     }
@@ -41,8 +41,8 @@ struct ChatScreen: View {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     HStack(spacing: 6) {
-                        if vm.temporary {
-                            Image(systemName: "clock.badge.xmark")
+                        if vm.mode != .server {
+                            Image(systemName: vm.mode.symbol)
                                 .font(.ody(size: 11)).foregroundStyle(theme.accent)
                         }
                         Text(vm.title)
@@ -50,6 +50,24 @@ struct ChatScreen: View {
                             .foregroundStyle(theme.fg).lineLimit(1)
                     }
                     modelMenu
+                }
+            }
+            // Mode picker (Claude-style ghost affordance, generalized to three
+            // modes): choose server / on-device / temporary while the chat is
+            // still empty. Locks once the conversation starts.
+            ToolbarItem(placement: .topBarTrailing) {
+                if vm.canChangeMode {
+                    Menu {
+                        Picker("Modo da conversa", selection: Binding(get: { vm.mode }, set: { vm.setMode($0) })) {
+                            ForEach(ChatMode.allCases, id: \.self) { m in
+                                Label(m.label, systemImage: m.symbol).tag(m)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: vm.mode.symbol)
+                            .foregroundStyle(vm.mode == .server ? theme.secondaryText : theme.accent)
+                    }
+                    .accessibilityLabel(Text("Modo da conversa"))
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
@@ -70,7 +88,9 @@ struct ChatScreen: View {
             }
         }
         .fullScreenCover(isPresented: $showVoice) {
-            VoiceView(app: app, seed: VoiceSeed(chatID: vm.chatID, messages: vm.messages, model: vm.selectedModel))
+            VoiceView(app: app,
+                      seed: VoiceSeed(chatID: vm.chatID, messages: vm.messages, model: vm.selectedModel),
+                      onCommit: { vm.ingestVoiceTurns($0) })
                 .environment(\.theme, theme)
         }
     }
@@ -148,7 +168,9 @@ struct ChatScreen: View {
         VStack(spacing: 8) {
             if vm.isStreaming { Divider().overlay(theme.border) }
             HStack(spacing: 8) {
-                toggleChip(system: "globe", label: "Buscar na web", on: $vm.webSearch)
+                featuresMenu
+                toggleChip(system: "photo.artframe", label: "Gerar imagem", on: $vm.imageMode)
+                if !app.tools.isEmpty { toolChip }
                 Spacer()
             }
             .padding(.horizontal, 12)
@@ -214,7 +236,10 @@ struct ChatScreen: View {
         } message: { Text(comingSoon ?? "") }
     }
 
-    private var inputPrompt: LocalizedStringKey { voice.isRecording ? "Ouvindo…" : "Mensagem…" }
+    private var inputPrompt: LocalizedStringKey {
+        if voice.isRecording { return "Ouvindo…" }
+        return vm.imageMode ? "Descreva a imagem…" : "Mensagem…"
+    }
     private var inputBinding: Binding<String> {
         voice.isRecording ? .constant(voice.partialText) : $vm.input
     }
@@ -232,7 +257,10 @@ struct ChatScreen: View {
             Button { showNotePicker = true } label: { Label("Anexar Notas", systemImage: "note.text") }
             Button { showKBPicker = true } label: { Label("Anexar Base de Conhecimento", systemImage: "cylinder.split.1x2") }
             Button { showChatPicker = true } label: { Label("Chats de Referência", systemImage: "clock.arrow.circlepath") }
-            Button { comingSoon = "Google Drive — em breve." } label: { Label("Google Drive", systemImage: "externaldrive") }
+            // Just the feature name (a brand, shown verbatim) — the localized
+            // alert title "Em breve" already means "coming soon", so we don't
+            // bake the pt-BR phrase into a String that Text() can't localize.
+            Button { comingSoon = "Google Drive" } label: { Label("Google Drive", systemImage: "externaldrive") }
         } label: {
             Image(systemName: "plus")
                 .font(.ody(size: 20))
@@ -332,11 +360,11 @@ struct ChatScreen: View {
     private var sendButton: some View {
         Button {
             if voice.isRecording {
-                Task { appendTranscript(await stopVoiceCapturing()); inputFocused = false; if canSend { vm.send() } }
+                Task { appendTranscript(await stopVoiceCapturing()); inputFocused = false; if canSend { submitComposer() } }
             } else if vm.isStreaming {
                 vm.stop()
             } else {
-                vm.send(); inputFocused = false
+                submitComposer(); inputFocused = false
             }
         } label: {
             Image(systemName: vm.isStreaming ? "stop.fill" : "arrow.up")
@@ -346,6 +374,54 @@ struct ChatScreen: View {
                 .background((canSend || vm.isStreaming || voice.isRecording) ? theme.accent : theme.border, in: Circle())
         }
         .disabled(!voice.isRecording && !vm.isStreaming && !canSend)
+    }
+
+    /// Open WebUI per-turn feature flags (web search / image generation / code
+    /// interpreter), consolidated into one chip-styled menu.
+    private var featuresMenu: some View {
+        let active = vm.webSearch || vm.imageGeneration || vm.codeInterpreter
+        return Menu {
+            Toggle(isOn: $vm.webSearch) { Label("Buscar na web", systemImage: "globe") }
+            Toggle(isOn: $vm.imageGeneration) { Label("Ilustrar resposta", systemImage: "photo") }
+            Toggle(isOn: $vm.codeInterpreter) { Label("Executar código", systemImage: "chevron.left.forwardslash.chevron.right") }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "sparkles").font(.ody(size: 11))
+                Text("Recursos").font(.ody(size: 12, design: .monospaced))
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .foregroundStyle(active ? .white : theme.secondaryText)
+            .background(active ? theme.accent : theme.panel, in: Capsule())
+            .overlay(Capsule().stroke(theme.border, lineWidth: active ? 0 : 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Enable/disable server tools (weather, MCP, …) for the next reply. Multi-
+    /// select menu styled like the toggle chips; accented when any are on.
+    private var toolChip: some View {
+        let active = !vm.selectedToolIDs.isEmpty
+        return Menu {
+            ForEach(app.tools) { t in
+                Button {
+                    if vm.selectedToolIDs.contains(t.id) { vm.selectedToolIDs.remove(t.id) }
+                    else { vm.selectedToolIDs.insert(t.id) }
+                } label: {
+                    Label(t.name, systemImage: vm.selectedToolIDs.contains(t.id) ? "checkmark" : "wrench.and.screwdriver")
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "wrench.and.screwdriver").font(.ody(size: 11))
+                Text("Ferramentas").font(.ody(size: 12, design: .monospaced))
+                if active { Text(verbatim: "\(vm.selectedToolIDs.count)").font(.ody(size: 11, design: .monospaced)) }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .foregroundStyle(active ? .white : theme.secondaryText)
+            .background(active ? theme.accent : theme.panel, in: Capsule())
+            .overlay(Capsule().stroke(theme.border, lineWidth: active ? 0 : 1))
+        }
+        .buttonStyle(.plain)
     }
 
     private func toggleChip(system: String, label: String, on: Binding<Bool>) -> some View {
@@ -363,8 +439,15 @@ struct ChatScreen: View {
     }
 
     private var canSend: Bool {
-        (!vm.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !vm.pendingImageURLs.isEmpty || !vm.pendingDocuments.isEmpty)
+        let hasText = !vm.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Image generation uses the server's default image engine — no LLM needed.
+        if vm.imageMode { return hasText }
+        return (hasText || !vm.pendingImageURLs.isEmpty || !vm.pendingDocuments.isEmpty)
             && vm.selectedModel != nil
+    }
+
+    /// Route the composer's send action: image generation or a chat turn.
+    private func submitComposer() {
+        if vm.imageMode { vm.generateImage() } else { vm.send() }
     }
 }

@@ -17,18 +17,22 @@ struct VoiceSeed: Identifiable {
 struct VoiceView: View {
     let app: AppState
     let seed: VoiceSeed?
+    /// Hands completed voice turns back to the host chat (shared thread + context).
+    let onCommit: (([OWMessage]) -> Void)?
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     @StateObject private var convo: VoiceConversation
     @ObservedObject private var speech = SpeechManager.shared
-    @State private var pulse = false
+    @State private var breathe = false
 
-    init(app: AppState, seed: VoiceSeed? = nil) {
+    init(app: AppState, seed: VoiceSeed? = nil, onCommit: (([OWMessage]) -> Void)? = nil) {
         self.app = app
         self.seed = seed
+        self.onCommit = onCommit
         _convo = StateObject(wrappedValue: VoiceConversation(client: app.client,
                                                              completions: app.completions,
-                                                             models: app.models))
+                                                             models: app.models,
+                                                             defaultModel: app.defaultModel))
     }
 
     var body: some View {
@@ -63,13 +67,11 @@ struct VoiceView: View {
             }
         }
         .tint(theme.accent)
-        .onChange(of: convo.phase) { _, p in
-            pulse = (p == .listening || p == .speaking)
-        }
         .onAppear {
             if speech.useServer { Task { await speech.loadServerVoices() } }
+            convo.onCommit = onCommit   // route turns into the host chat
             if let seed { convo.seedOnce(chatID: seed.chatID, messages: seed.messages, model: seed.model) }
-            else if !convo.active { convo.reset() }   // Voz tab → always a new conversation
+            else if !convo.active { convo.reset() }
         }
     }
 
@@ -82,7 +84,7 @@ struct VoiceView: View {
             } label: {
                 HStack(spacing: 3) {
                     Image(systemName: "person.wave.2").font(.system(size: 9))
-                    Text(speech.serverVoices.first { $0.id == convo.ttsVoice }?.name ?? "Voz")
+                    Text(speech.serverVoices.first { $0.id == convo.ttsVoice }?.name ?? L("Voz"))
                         .font(.ody(size: 11, design: .monospaced)).lineLimit(1)
                 }.foregroundStyle(theme.accent)
             }
@@ -128,40 +130,36 @@ struct VoiceView: View {
 
     // MARK: - Orb
 
+    /// ChatGPT-style soft white blob (no icon). It breathes slowly, swells with
+    /// your voice while listening, glows brighter while speaking, and shows a
+    /// spinner while thinking. An accent aura keeps it visible on light themes.
     private var orb: some View {
-        ZStack {
+        let amp = convo.phase == .listening ? CGFloat(min(max(convo.level, 0), 1)) : 0
+        let active = convo.phase == .listening || convo.phase == .speaking
+        return ZStack {
             Circle()
-                .fill(theme.accent.opacity(0.18))
-                .frame(width: 190, height: 190)
-                .scaleEffect(pulse ? 1.12 : 0.9)
-                .animation(pulse ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
-                                 : .easeOut(duration: 0.3), value: pulse)
+                .fill(RadialGradient(colors: [theme.accent.opacity(0.35), .clear],
+                                     center: .center, startRadius: 20, endRadius: 150))
+                .frame(width: 300, height: 300)
+                .scaleEffect(breathe ? 1.06 : 0.9)
             Circle()
-                .fill(theme.accent.opacity(0.30))
-                .frame(width: 140, height: 140)
-            Circle()
-                .fill(theme.accent)
-                .frame(width: 104, height: 104)
-            Group {
-                switch convo.phase {
-                case .thinking:
-                    ProgressView().tint(theme.bg).controlSize(.large)
-                default:
-                    Image(systemName: orbIcon).font(.system(size: 40, weight: .semibold))
-                        .foregroundStyle(theme.bg)
-                        .symbolEffect(.variableColor.iterative, isActive: convo.phase == .speaking)
-                }
+                .fill(RadialGradient(colors: [.white, .white.opacity(0.85), .white.opacity(0.2)],
+                                     center: .init(x: 0.42, y: 0.40), startRadius: 6, endRadius: 120))
+                .frame(width: 176, height: 176)
+                .blur(radius: 3)
+                .overlay(Circle().stroke(.white.opacity(0.5), lineWidth: 1).blur(radius: 1))
+                .shadow(color: .white.opacity(active ? 0.6 : 0.3), radius: active ? 34 : 18)
+                .scaleEffect(0.9 + amp * 0.35 + (breathe ? 0.05 : 0))
+            if convo.phase == .thinking {
+                ProgressView().tint(theme.accent).controlSize(.large)
             }
         }
+        .frame(height: 300)
         .contentShape(Circle())
         .onTapGesture { convo.tapOrb() }
-    }
-
-    private var orbIcon: String {
-        switch convo.phase {
-        case .listening: return "waveform"
-        case .speaking:  return "speaker.wave.3.fill"
-        default:         return "mic.fill"
+        .animation(.easeOut(duration: 0.12), value: amp)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 2.4).repeatForever(autoreverses: true)) { breathe = true }
         }
     }
 
@@ -206,7 +204,7 @@ struct VoiceView: View {
             ForEach(convo.models) { m in Button(m.shortName) { convo.model = m.id } }
         } label: {
             HStack(spacing: 3) {
-                Text(convo.models.first { $0.id == convo.model }?.shortName ?? "Modelo")
+                Text(convo.models.first { $0.id == convo.model }?.shortName ?? L("Modelo"))
                     .font(.ody(size: 11, design: .monospaced)).lineLimit(1)
                 Image(systemName: "chevron.up.chevron.down").font(.system(size: 8))
             }

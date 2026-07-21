@@ -3,6 +3,9 @@ import Foundation
 import Speech
 import SwiftWhisper
 import OpenWebUIKit
+#if os(iOS)
+import UIKit
+#endif
 
 /// Records the mic and transcribes to text using the engine chosen in Settings:
 /// **native** (`SFSpeechRecognizer`) or **model** (a downloaded Whisper GGUF via
@@ -52,6 +55,24 @@ final class VoiceInputManager: ObservableObject {
 
     /// Injected at startup — required for the "server" STT engine.
     var client: OpenWebUIClient?
+
+    init() {
+        #if os(iOS)
+        // Free the loaded Whisper model (100s of MB–1 GB+) under memory pressure.
+        // It reloads from disk on the next on-device transcription.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [weak self] _ in Task { @MainActor in self?.releaseModel() } }
+        #endif
+    }
+
+    /// Drop the resident Whisper model. Safe to call anytime — the next
+    /// transcription reloads it (see `transcribeWithWhisper`).
+    func releaseModel() {
+        guard !isRecording, !processing else { return }
+        cachedWhisper = nil
+        cachedModelID = ""
+    }
 
     // MARK: - Start
 

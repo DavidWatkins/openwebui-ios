@@ -1,25 +1,14 @@
 import SwiftUI
 import OpenWebUIKit
 
-/// Main tabbed shell once logged in: Conversas + Notas. (Workspace tab next.)
+/// Single-surface shell once logged in: the chat list is the app. Voice launches
+/// from inside a chat; image generation is a chat mode; Notes and Workspace live
+/// behind the menu in the chat list's toolbar. (Formerly a 5-tab TabView.)
 struct MainView: View {
     let app: AppState
-    @Environment(\.theme) private var theme
 
     var body: some View {
-        TabView {
-            ChatListView(app: app)
-                .tabItem { Label("Conversas", systemImage: "bubble.left.and.bubble.right") }
-            NotesView(app: app)
-                .tabItem { Label("Notas", systemImage: "note.text") }
-            ImageGenView(app: app)
-                .tabItem { Label("Imagem", systemImage: "photo.artframe") }
-            VoiceView(app: app)
-                .tabItem { Label("Voz", systemImage: "waveform") }
-            WorkspaceView(app: app)
-                .tabItem { Label("Workspace", systemImage: "square.grid.2x2") }
-        }
-        .tint(theme.accent)
+        ChatListView(app: app)
     }
 }
 
@@ -31,7 +20,12 @@ struct ChatListView: View {
     @StateObject private var store: ChatStore
     @State private var path: [ChatRoute] = []
     @State private var showSettings = false
+    @State private var showNotes = false
+    @State private var showWorkspace = false
+    @State private var showImages = false
     @State private var search = ""
+    /// Open a fresh chat on first launch (Claude-style), once per session.
+    @State private var didAutoOpen = false
     @State private var renaming: OWChatSummary?
     @State private var renameText = ""
     @State private var shareItem: ShareableURL?
@@ -43,7 +37,7 @@ struct ChatListView: View {
 
     enum ChatRoute: Hashable {
         case existing(OWChatSummary)
-        case new(temporary: Bool)
+        case new(mode: ChatMode)
     }
 
     private var filtered: [OWChatSummary] {
@@ -61,17 +55,22 @@ struct ChatListView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    // Secondary destinations tuck behind one menu so the chat list
+                    // stays the single top-level surface (no more tab bar).
+                    Menu {
+                        Button { showSettings = true } label: { Label("Ajustes", systemImage: "gearshape") }
+                        Divider()
+                        Button { showNotes = true } label: { Label("Notas", systemImage: "note.text") }
+                        Button { showImages = true } label: { Label("Imagem", systemImage: "photo.artframe") }
+                        Button { showWorkspace = true } label: { Label("Workspace", systemImage: "square.grid.2x2") }
+                    } label: {
+                        Image(systemName: "line.3.horizontal")
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button { path.append(.new(temporary: false)) } label: {
-                            Label("Nova conversa", systemImage: "square.and.pencil")
-                        }
-                        Button { path.append(.new(temporary: true)) } label: {
-                            Label("Conversa temporária", systemImage: "clock.badge.xmark")
-                        }
-                    } label: {
+                    // Opens a new chat in the user's default mode; the mode can be
+                    // changed inside the chat (server / on-device / temporary).
+                    Button { path.append(.new(mode: app.preferredChatMode)) } label: {
                         Image(systemName: "square.and.pencil")
                     }
                 }
@@ -80,16 +79,33 @@ struct ChatListView: View {
                 switch route {
                 case .existing(let c):
                     ChatScreen(app: app, chat: c, onChanged: { Task { await store.load() } })
-                case .new(let temp):
-                    ChatScreen(app: app, chat: nil, temporary: temp, onChanged: { Task { await store.load() } })
+                case .new(let mode):
+                    ChatScreen(app: app, chat: nil, mode: mode, onChanged: { Task { await store.load() } })
                 }
             }
             .task { await store.load() }
             .refreshable { await store.load() }
+            .onAppear {
+                // Boot straight into a new chat (Claude iOS style); the list is one
+                // back-swipe away. Once per session so returning here doesn't re-open.
+                if !didAutoOpen {
+                    didAutoOpen = true
+                    path.append(.new(mode: app.preferredChatMode))
+                }
+            }
         }
         .tint(theme.accent)
         .sheet(isPresented: $showSettings) {
             SettingsView().environmentObject(app).environmentObject(themes)
+        }
+        .sheet(isPresented: $showNotes) {
+            NotesView(app: app).environment(\.theme, theme)
+        }
+        .sheet(isPresented: $showWorkspace) {
+            WorkspaceView(app: app).environment(\.theme, theme)
+        }
+        .sheet(isPresented: $showImages) {
+            ImageGenView(app: app).environment(\.theme, theme)
         }
         .sheet(item: $shareItem) { item in ShareSheet(items: [item.url]) }
         .alert("Renomear conversa", isPresented: Binding(
@@ -149,6 +165,9 @@ struct ChatListView: View {
     private func row(_ chat: OWChatSummary) -> some View {
         HStack(spacing: 10) {
             if chat.pinned { Image(systemName: "pin.fill").font(.caption2).foregroundStyle(theme.accent) }
+            // On-device-only chats are badged so they're distinguishable from
+            // server chats in the same list.
+            if chat.isLocal { Image(systemName: "iphone").font(.caption2).foregroundStyle(theme.accent) }
             VStack(alignment: .leading, spacing: 2) {
                 Text(chat.title).font(.ody(.subheadline, design: .monospaced))
                     .foregroundStyle(theme.fg).lineLimit(1)
@@ -197,7 +216,7 @@ struct ChatListView: View {
             BrandMark(size: 56)
             Text("Nenhuma conversa ainda")
                 .font(.ody(.headline, design: .monospaced)).foregroundStyle(theme.fg)
-            Button { path.append(.new(temporary: false)) } label: {
+            Button { path.append(.new(mode: app.preferredChatMode)) } label: {
                 Label("Nova conversa", systemImage: "square.and.pencil")
                     .font(.ody(.subheadline, design: .monospaced))
                     .padding(.horizontal, 16).padding(.vertical, 10)
@@ -246,15 +265,18 @@ struct ShareSheet: View {
 }
 #endif
 
-/// Shared pt-BR relative-time formatter.
+/// Relative-time formatter that follows the app's selected UI language, not a
+/// fixed locale — otherwise "3 sem"/"agora" leak Portuguese into every other
+/// language. The locale is re-read on each call so a runtime language switch
+/// (LanguageManager) takes effect without an app relaunch.
 enum RelativeDate {
     private static let fmt: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
-        f.locale = Locale(identifier: "pt_BR")
         f.unitsStyle = .abbreviated
         return f
     }()
     static func string(_ epochSeconds: Double) -> String {
-        fmt.localizedString(for: Date(timeIntervalSince1970: epochSeconds), relativeTo: Date())
+        fmt.locale = LanguageManager.shared.locale
+        return fmt.localizedString(for: Date(timeIntervalSince1970: epochSeconds), relativeTo: Date())
     }
 }

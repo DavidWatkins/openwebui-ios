@@ -18,35 +18,69 @@ final class ChatViewModel: ObservableObject {
     @Published var uploading = false
     /// Composer toggle: web search for the next reply.
     @Published var webSearch = false
+    /// Composer toggle: the next prompt generates an image (server image engine)
+    /// instead of a chat reply. Mutually exclusive with webSearch.
+    @Published var imageMode = false { didSet { if imageMode { webSearch = false } } }
+    /// Server tool/function ids enabled for the next reply (weather, MCP, …).
+    /// Open WebUI runs the function-calling loop server-side when these are set.
+    @Published var selectedToolIDs: Set<String> = []
+    /// Open WebUI per-turn feature flags (server generates an image from the reply /
+    /// runs code). Distinct from `imageMode`, which is the manual image composer.
+    @Published var imageGeneration = false
+    @Published var codeInterpreter = false
 
     let models: [OWModel]
 
-    /// A temporary chat is never saved to the server (ephemeral).
-    let temporary: Bool
+    /// Where this chat's history lives: server / on-device / ephemeral.
+    /// Changeable via the mode control, but only while the chat is still empty.
+    @Published private(set) var mode: ChatMode
 
-    /// nil until the conversation is persisted server-side (new chat).
+    /// nil until the conversation is persisted (new chat). For `.local` chats
+    /// this is the on-device id; for `.server` chats, the server id.
     private(set) var chatID: String?
     /// Fired after a turn finishes so the list can refresh.
     var onChanged: (() -> Void)?
+    /// Supplies the ambient-context system message (date/time, location, custom
+    /// instructions) to prepend to each turn. Evaluated per-send so it stays live.
+    var contextProvider: (() -> OWChatMessageInput?)?
 
     private let client: OpenWebUIClient
     private let completions: ChatCompletionsClient
+    private let localStore: LocalChatStore
     private var streamTask: Task<Void, Never>?
     private var historyTask: Task<Void, Never>?
     private var historyLoaded = false
 
     init(client: OpenWebUIClient, completions: ChatCompletionsClient,
-         chat: OWChatSummary?, models: [OWModel], defaultModel: String?, temporary: Bool = false) {
+         chat: OWChatSummary?, models: [OWModel], defaultModel: String?,
+         mode: ChatMode = .server, localStore: LocalChatStore,
+         initialToolIDs: Set<String> = []) {
         self.client = client
         self.completions = completions
+        self.localStore = localStore
         self.models = models
-        self.temporary = temporary
+        self.mode = mode
         self.chatID = chat?.id
-        self.title = chat?.title ?? (temporary ? L("Conversa temporária") : L("Nova conversa"))
+        self.title = chat?.title ?? Self.placeholderTitle(mode)
         self.selectedModel = defaultModel
+        self.selectedToolIDs = initialToolIDs
+    }
+
+    private static func placeholderTitle(_ m: ChatMode) -> String {
+        m == .temporary ? L("Conversa temporária") : L("Nova conversa")
     }
 
     var isNewChat: Bool { chatID == nil }
+
+    /// Mode can only change before the conversation has started — once there are
+    /// messages (or it's been saved), switching would strand or drop history.
+    var canChangeMode: Bool { chatID == nil && messages.isEmpty && !isStreaming }
+
+    func setMode(_ m: ChatMode) {
+        guard canChangeMode, m != mode else { return }
+        mode = m
+        title = Self.placeholderTitle(m)   // keep the placeholder in sync
+    }
 
     var selectedModelName: String {
         guard let id = selectedModel else { return L("Selecionar modelo") }
@@ -72,6 +106,13 @@ final class ChatViewModel: ObservableObject {
 
     private func runHistoryLoad() {
         guard let id = chatID else { return }
+        // Local chats read straight from SwiftData — no network, no async.
+        if mode == .local {
+            messages = localStore.messages(id: id)
+            if let m = localStore.chat(id: id)?.modelID { selectedModel = m }
+            historyLoaded = true
+            return
+        }
         isLoadingHistory = true
         historyTask = Task { @MainActor in
             defer { self.isLoadingHistory = false; self.historyTask = nil }
@@ -176,7 +217,45 @@ final class ChatViewModel: ObservableObject {
         if convo.count > 1 {
             for i in convo.indices.dropLast() { convo[i].imageURLs = [] }
         }
+        // Ambient context (date/time, location, custom instructions) goes first.
+        if let ctx = contextProvider?() { convo.insert(ctx, at: 0) }
         streamTask = Task { await self.runStream(model: model, convo: convo, files: docs, assistantID: assistant.id) }
+    }
+
+    /// Image-generation turn: the prompt goes to the server's image engine
+    /// (ComfyUI/Automatic1111/etc., whatever Open WebUI is configured with) and
+    /// the result is inserted as an assistant image message, ChatGPT-style.
+    /// `model: nil` lets the server use its default image model.
+    func generateImage() {
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isStreaming else { return }
+        input = ""; error = nil
+
+        messages.append(OWMessage(role: .user, content: text, timestamp: Date().timeIntervalSince1970))
+        // No model tag on the reply — the header would otherwise show an LLM name
+        // that had nothing to do with the image engine.
+        let assistant = OWMessage(role: .assistant, content: "")
+        messages.append(assistant)
+        isStreaming = true
+        streamTask = Task { await self.runImageGen(prompt: text, assistantID: assistant.id) }
+    }
+
+    private func runImageGen(prompt: String, assistantID: String) async {
+        do {
+            let urls = try await client.generateImages(OWImageRequest(prompt: prompt))
+            guard let i = index(of: assistantID) else { return }
+            if urls.isEmpty {
+                messages[i].content = L("Não foi possível gerar a imagem.")
+            } else {
+                messages[i].imageURLs = urls
+            }
+        } catch is CancellationError {
+        } catch {
+            let msg = friendlyError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            if let i = index(of: assistantID) { messages[i].content = "⚠️ \(msg)" }
+        }
+        isStreaming = false
+        await persist()
     }
 
     private func runStream(model: String, convo: [OWChatMessageInput],
@@ -184,13 +263,16 @@ final class ChatViewModel: ObservableObject {
         var sawText = false
         do {
             for try await update in completions.stream(model: model, messages: convo, files: files,
-                                                       options: OWStreamOptions(webSearch: webSearch)) {
+                                                       options: OWStreamOptions(webSearch: webSearch,
+                                                                                imageGeneration: imageGeneration,
+                                                                                codeInterpreter: codeInterpreter,
+                                                                                toolIDs: Array(selectedToolIDs))) {
                 switch update {
                 case .textDelta(let d):
                     sawText = true
                     append(assistantID, d)
-                case .reasoningDelta:
-                    break   // TODO: surface reasoning in a disclosure (phase 2)
+                case .reasoningDelta(let d):
+                    appendReasoning(assistantID, d)
                 case .error(let msg):
                     setContent(assistantID, friendlyError(msg))
                 case .done:
@@ -223,11 +305,21 @@ final class ChatViewModel: ObservableObject {
         return msg
     }
 
-    /// Saves the conversation to the server (creates on the first turn, updates after).
+    /// Persists the conversation per its mode: temporary → nothing, local →
+    /// on-device SwiftData, server → Open WebUI.
     private func persist() async {
-        guard !temporary else { return }   // ephemeral — never saved
+        guard mode != .temporary else { return }   // ephemeral — never saved
         guard !messages.isEmpty, let model = selectedModel else { return }
         let title = chatTitle()
+
+        if mode == .local {
+            // On-device only — never touches the server/account database.
+            let id = localStore.save(id: chatID, title: title, modelID: model, messages: messages)
+            if chatID == nil { chatID = id; self.title = title }
+            onChanged?()
+            return
+        }
+
         do {
             if let id = chatID {
                 // updateChat REPLACES the whole chat server-side. If the web UI
@@ -266,11 +358,34 @@ final class ChatViewModel: ObservableObject {
         isStreaming = false
     }
 
+    /// Merge turns produced by a voice session into this chat, then persist per
+    /// mode. Voice is seeded from our messages, so only genuinely new turns are
+    /// appended (keeps image/doc attachments on the originals intact). This is
+    /// what makes a voice conversation carry over into the typed thread and share
+    /// context both ways.
+    func ingestVoiceTurns(_ voiceMessages: [OWMessage]) {
+        let known = Set(messages.map(\.id))
+        let fresh = voiceMessages.filter { !known.contains($0.id) && !$0.content.isEmpty }
+        guard !fresh.isEmpty else { return }
+        messages.append(contentsOf: fresh)
+        // Serialize persists: voice can commit turns back-to-back, and two
+        // concurrent first-turn saves would each createChat → duplicate chats.
+        let prev = persistChain
+        persistChain = Task { await prev?.value; await persist(); onChanged?() }
+    }
+    private var persistChain: Task<Void, Never>?
+
     // MARK: - Mutation helpers
 
     private func index(of id: String) -> Int? { messages.firstIndex { $0.id == id } }
     private func append(_ id: String, _ text: String) {
         if let i = index(of: id) { messages[i].content += text }
+    }
+    /// Seeds `reasoning` on the first delta (nil → "") so the disclosure appears
+    /// as soon as the model starts thinking, before any text arrives.
+    private func appendReasoning(_ id: String, _ text: String) {
+        guard let i = index(of: id) else { return }
+        messages[i].reasoning = (messages[i].reasoning ?? "") + text
     }
     private func setContent(_ id: String, _ text: String) {
         if let i = index(of: id) { messages[i].content = text }

@@ -110,9 +110,14 @@ struct Theme: Equatable, Identifiable {
 
     static func named(_ id: String) -> Theme { all.first { $0.id == id } ?? all[0] }
 
-    /// Default for a clean install = Hermes, so it matches the primary
-    /// (asset-catalog) Hermes-blue app icon out of the box — no icon-change alert.
-    static let defaultID = "hermes"
+    /// Default for a clean install = Open WebUI (neutral dark surface, blue
+    /// accent, sans) — the Hermes electric-blue/serif skin was too heavy as a
+    /// first impression. The home-screen icon stays the primary (Hermes-blue)
+    /// asset on a fresh install: we deliberately don't sync the icon at launch,
+    /// because `setAlternateIconName` always fires a system alert and one on the
+    /// very first open would be worse than a briefly mismatched (still-blue)
+    /// icon. Choosing any theme reconciles the icon via `AppIconManager`.
+    static let defaultID = "openwebui"
     static let odysseus = named(defaultID)
 
     // MARK: - Helpers

@@ -138,16 +138,25 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
     public var imageURLs: [String]
     /// Non-image attachments (documents → RAG).
     public var documents: [OWAttachment]
+    /// Extended-thinking text emitted before the reply, for models that expose it.
+    /// nil = the model never sent any (renders nothing), "" = it started and we
+    /// are still streaming the first token.
+    public var reasoning: String?
 
     public init(id: String = UUID().uuidString, role: OWRole, content: String,
                 model: String? = nil, timestamp: Double? = nil,
-                imageURLs: [String] = [], documents: [OWAttachment] = []) {
+                imageURLs: [String] = [], documents: [OWAttachment] = [],
+                reasoning: String? = nil) {
         self.id = id; self.role = role; self.content = content
         self.model = model; self.timestamp = timestamp
         self.imageURLs = imageURLs; self.documents = documents
+        self.reasoning = reasoning
     }
 
-    enum CodingKeys: String, CodingKey { case id, role, content, model, timestamp, files, parentId }
+    enum CodingKeys: String, CodingKey {
+        case id, role, content, model, timestamp, files, parentId
+        case reasoning, reasoning_content
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -177,6 +186,14 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
         model = try? c.decodeIfPresent(String.self, forKey: .model)
         timestamp = try? c.decode(Double.self, forKey: .timestamp)
         parentId = try? c.decodeIfPresent(String.self, forKey: .parentId)
+
+        // Open WebUI is inconsistent about which key holds thinking text, and the
+        // streaming delta uses both too (see ChatCompletionsClient). Accept either;
+        // treat an empty string as absent so the disclosure doesn't render blank.
+        let think = (try? c.decodeIfPresent(String.self, forKey: .reasoning))
+            ?? (try? c.decodeIfPresent(String.self, forKey: .reasoning_content))
+            ?? nil
+        reasoning = (think?.isEmpty == false) ? think : nil
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -186,6 +203,12 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
         try c.encode(content, forKey: .content)
         try c.encodeIfPresent(model, forKey: .model)
         try c.encodeIfPresent(timestamp, forKey: .timestamp)
+        // Persist thinking so it survives a history reload. `reasoning_content` is
+        // the OpenAI-compatible name the backend pipes through; the decoder above
+        // also accepts `reasoning`, so our own round-trip works either way.
+        if let reasoning, !reasoning.isEmpty {
+            try c.encode(reasoning, forKey: .reasoning_content)
+        }
         var files = imageURLs.map { OWAttachment(type: "image", url: $0) }
         files += documents
         if !files.isEmpty { try c.encode(files, forKey: .files) }
@@ -203,15 +226,21 @@ public struct OWChatSummary: Decodable, Identifiable, Hashable, Sendable {
     public var createdAt: Double?
     public var pinned: Bool
     public var archived: Bool
+    /// True for chats that live only on this device (SwiftData), not on the
+    /// server. Never decoded from the API — set by the local store. The custom
+    /// decoder below leaves it at its `false` default for server chats.
+    public var isLocal: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case id, title, updated_at, created_at, pinned, archived
     }
 
     public init(id: String, title: String, updatedAt: Double? = nil,
-                createdAt: Double? = nil, pinned: Bool = false, archived: Bool = false) {
+                createdAt: Double? = nil, pinned: Bool = false, archived: Bool = false,
+                isLocal: Bool = false) {
         self.id = id; self.title = title; self.updatedAt = updatedAt
         self.createdAt = createdAt; self.pinned = pinned; self.archived = archived
+        self.isLocal = isLocal
     }
 
     public init(from decoder: Decoder) throws {

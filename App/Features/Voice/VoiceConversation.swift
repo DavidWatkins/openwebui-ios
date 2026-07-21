@@ -23,6 +23,8 @@ final class VoiceConversation: ObservableObject {
     @Published var reply = ""           // streaming assistant reply
     @Published var error: String?
     @Published var model: String?
+    /// Live mic loudness (0…1) while listening — drives the orb's reaction.
+    @Published private(set) var level: Float = 0
     /// Per-conversation server TTS voice ("" = global default). Persisted per chat.
     @Published var ttsVoice: String = ""
 
@@ -37,6 +39,12 @@ final class VoiceConversation: ObservableObject {
 
     /// Server chat this voice session is being saved to (created on first reply).
     private var chatID: String?
+
+    /// When set (voice launched from a chat), completed turns are handed to the
+    /// host `ChatViewModel` instead of being saved here — so voice and text share
+    /// one thread, carry over both ways, and honor the chat's mode (server/local/
+    /// temporary). nil = legacy standalone behaviour (self-persist to the server).
+    var onCommit: (([OWMessage]) -> Void)?
 
     private var cancellables = Set<AnyCancellable>()
     private var silenceTimer: Timer?
@@ -60,11 +68,13 @@ final class VoiceConversation: ObservableObject {
 
     private var seeded = false
 
-    init(client: OpenWebUIClient, completions: ChatCompletionsClient, models: [OWModel]) {
+    init(client: OpenWebUIClient, completions: ChatCompletionsClient, models: [OWModel],
+         defaultModel: String? = nil) {
         self.client = client
         self.completions = completions
         self.models = models
-        self.model = models.first?.id
+        // Honor the user's preferred default model (falls back to the first).
+        self.model = defaultModel ?? models.first?.id
         voice.client = client   // enables the "server" STT engine
         voice.$partialText
             .receive(on: RunLoop.main)
@@ -204,6 +214,10 @@ final class VoiceConversation: ObservableObject {
     }
 
     private func levelChanged(_ lvl: Float) {
+        // Throttle UI churn: only republish on a meaningful change so the orb's
+        // (blur/shadow) layers don't re-render on every audio callback.
+        let next: Float = (phase == .listening) ? lvl : 0
+        if abs(next - level) > 0.04 { level = next }
         guard phase == .listening else { return }
         if lvl > speechLevel { heardSpeech = true; lastLoud = Date() }
     }
@@ -262,12 +276,34 @@ final class VoiceConversation: ObservableObject {
                     default: break
                     }
                 }
-                await self.persist()
+                self.commit()
                 self.speak()
             } catch {
                 self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 self.afterSpeaking()
             }
+        }
+    }
+
+    /// Turns rendered as chat messages (drops empty ones).
+    private func currentMessages() -> [OWMessage] {
+        turns.compactMap { t in
+            let txt = t.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !txt.isEmpty else { return nil }
+            return OWMessage(id: t.id,
+                             role: t.role == "user" ? .user : .assistant,
+                             content: txt,
+                             model: t.role == "user" ? nil : model,
+                             timestamp: t.at.timeIntervalSince1970)
+        }
+    }
+
+    /// Hand the turn off to the host chat if attached; otherwise self-persist.
+    private func commit() {
+        if let onCommit {
+            onCommit(currentMessages())
+        } else {
+            Task { await persist() }
         }
     }
 
@@ -330,9 +366,16 @@ final class VoiceConversation: ObservableObject {
         Task { await listen() }
     }
 
-    static let systemPrompt = """
-    Você é um companheiro de voz amigável, falando português do Brasil. \
-    Responda de forma curta e natural (1 a 3 frases), como numa conversa falada. \
-    Nada de listas, markdown ou emojis — apenas fala fluida.
-    """
+    /// Follows the app's selected UI language instead of forcing pt-BR — the
+    /// prompt previously hard-coded "falando português do Brasil", so the agent
+    /// always replied in Portuguese regardless of the user's language.
+    static var systemPrompt: String {
+        let language = LanguageManager.shared.current.endonym   // e.g. "English", "Português"
+        return """
+        You are a friendly voice companion. Reply in \(language) (unless the user \
+        clearly speaks another language, then match theirs). Keep replies short and \
+        natural — 1 to 3 sentences, like spoken conversation. No lists, markdown, or \
+        emoji, just fluid speech.
+        """
+    }
 }
