@@ -37,6 +37,8 @@ public actor OWSocket {
 
     /// Server-assigned Engine.IO session id (also the chat `session_id`). nil until connected.
     public private(set) var sid: String?
+    /// Whether the websocket is still live (drops after backgrounding / network loss).
+    public var isConnected: Bool { task?.state == .running && sid != nil }
     /// Fired for every routed `events` message. Set before `connect()`.
     public var onEvent: (@Sendable (Event) -> Void)?
 

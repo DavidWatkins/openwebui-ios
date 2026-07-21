@@ -167,6 +167,15 @@ struct ChatScreen: View {
     private var composer: some View {
         VStack(spacing: 8) {
             if vm.isStreaming { Divider().overlay(theme.border) }
+            if let status = vm.toolStatus {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(status).font(.ody(size: 11, design: .monospaced)).foregroundStyle(theme.secondaryText)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .transition(.opacity)
+            }
             HStack(spacing: 8) {
                 featuresMenu
                 toggleChip(system: "photo.artframe", label: "Gerar imagem", on: $vm.imageMode)

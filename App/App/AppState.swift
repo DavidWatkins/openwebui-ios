@@ -144,6 +144,7 @@ final class AppState: ObservableObject {
     }
 
     func logout() async {
+        await client.closeSocket()
         await client.signOut()
         user = nil
         models = []

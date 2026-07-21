@@ -24,6 +24,8 @@ final class ChatViewModel: ObservableObject {
     /// Server tool/function ids enabled for the next reply (weather, MCP, …).
     /// Open WebUI runs the function-calling loop server-side when these are set.
     @Published var selectedToolIDs: Set<String> = []
+    /// Live tool-progress line from the socket flow (e.g. "🔧 weather: Boston").
+    @Published var toolStatus: String?
     /// Open WebUI per-turn feature flags (server generates an image from the reply /
     /// runs code). Distinct from `imageMode`, which is the manual image composer.
     @Published var imageGeneration = false
@@ -219,7 +221,66 @@ final class ChatViewModel: ObservableObject {
         }
         // Ambient context (date/time, location, custom instructions) goes first.
         if let ctx = contextProvider?() { convo.insert(ctx, at: 0) }
-        streamTask = Task { await self.runStream(model: model, convo: convo, files: docs, assistantID: assistant.id) }
+        // Server chats stream token-by-token over the socket; local/temporary chats
+        // (no server chat id) use the buffered SSE path.
+        if mode == .server {
+            streamTask = Task { await self.runSocketTurn(model: model, convo: convo, files: docs, assistant: assistant) }
+        } else {
+            streamTask = Task { await self.runStream(model: model, convo: convo, files: docs, assistantID: assistant.id) }
+        }
+    }
+
+    /// True token streaming via the socket flow (server chats). Ensures the chat +
+    /// empty assistant message exist server-side (so events route by id), then
+    /// consumes cumulative content + tool status. Falls back to buffered SSE if the
+    /// chat can't be prepared.
+    private func runSocketTurn(model: String, convo: [OWChatMessageInput],
+                               files: [OWAttachment], assistant: OWMessage) async {
+        do {
+            let title = chatTitle()
+            if let id = chatID {
+                try await client.updateChat(id: id, title: title, model: model, messages: messages)
+            } else {
+                let id = try await client.createChat(title: title, model: model, messages: messages)
+                chatID = id; self.title = title
+            }
+        } catch is CancellationError {
+            isStreaming = false; return
+        } catch {
+            await runStream(model: model, convo: convo, files: files, assistantID: assistant.id)
+            return
+        }
+        guard let chatID else {
+            await runStream(model: model, convo: convo, files: files, assistantID: assistant.id); return
+        }
+
+        var sawContent = false
+        let options = OWStreamOptions(webSearch: webSearch, imageGeneration: imageGeneration,
+                                      codeInterpreter: codeInterpreter, toolIDs: Array(selectedToolIDs))
+        for await update in client.socketStream(chatID: chatID, messageID: assistant.id,
+                                                model: model, messages: convo, files: files, options: options) {
+            if Task.isCancelled { break }
+            switch update {
+            case .content(let full):
+                sawContent = true
+                setContent(assistant.id, full)   // cumulative → replace, not append
+            case .status(let s):
+                toolStatus = s
+            case .done:
+                break
+            case .error(let msg):
+                let m = friendlyError(msg)
+                if let i = index(of: assistant.id), messages[i].content.isEmpty { messages[i].content = "⚠️ \(m)" }
+                else { self.error = m }
+            }
+        }
+        toolStatus = nil
+        isStreaming = false
+        if !sawContent, let i = index(of: assistant.id), messages[i].content.isEmpty {
+            messages[i].content = L("_(sem resposta)_")
+        }
+        // The socket flow already persisted the reply server-side; just refresh.
+        onChanged?()
     }
 
     /// Image-generation turn: the prompt goes to the server's image engine

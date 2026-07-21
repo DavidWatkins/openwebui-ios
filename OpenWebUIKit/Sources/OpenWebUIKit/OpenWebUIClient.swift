@@ -11,6 +11,9 @@ public final class OpenWebUIClient: @unchecked Sendable {
     public let session: URLSession
     /// Session for long transfers (SSE streams, generation, uploads) — no 30s resource cap.
     public let longSession: URLSession
+    /// Shared real-time socket for true token streaming (server chats). Lazily
+    /// connected on first use; see `OWSocketStream.swift`.
+    var socket: OWSocket?
 
     public init(config: OWConfig = .default, tokens: OWKeychainStore = OWKeychainStore()) {
         self.config = config
