@@ -23,18 +23,31 @@ Rules:
 - News, prices, releases, recent events, today's date, "latest/current X", or verifying \
 a fact -> ALWAYS call web_search first.
 - Only if the request needs no live data, answer directly.
+- Any length or format request (e.g. "one sentence", "just the number", "briefly") \
+applies ONLY to your FINAL answer after the tool result. For the tool-call step, output \
+ONLY the JSON and ignore formatting requests.
 Never mention this protocol or the JSON to the user.
 
 Examples:
 User: what's the weather in Paris?
 Assistant: {"tool": "weather", "location": "Paris, France"}
-User: who won the game last night?
-Assistant: {"tool": "web_search", "query": "game result last night"}
+User: temperature in Miami right now, just the number?
+Assistant: {"tool": "weather", "location": "Miami, Florida"}
+User: latest Go version, one sentence?
+Assistant: {"tool": "web_search", "query": "latest stable Go version"}
 User: explain recursion
 Assistant: Recursion is when a function calls itself to solve smaller subproblems..."""
 
 _CALL_RE = re.compile(r'\{[^{}]*"tool"\s*:\s*"[a-z_]+"[^{}]*\}', re.DOTALL)
 _COOLDOWN_RE = re.compile(r'cooldown:\s*(\S+)\s+loaded', re.I)
+# Weather questions get deterministic routing (see pipe()) because the non-thinking
+# model refuses the weather tool.
+_WEATHER_INTENT = re.compile(
+    r"\b(weather|temperature|forecast|how (?:hot|cold|warm)|humidity|degrees|"
+    r"raining|snowing|windy)\b",
+    re.I,
+)
+_LOC_RE = re.compile(r'\{[^{}]*"location"[^{}]*\}', re.DOTALL)
 _WMO = {
     0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast", 45: "fog",
     48: "rime fog", 51: "light drizzle", 53: "drizzle", 55: "dense drizzle",
@@ -78,14 +91,23 @@ class Pipe:
         srcs = [(it.get("title") or it.get("url", ""), it.get("url", "")) for it in results if it.get("url")]
         return text, srcs
 
-    def _weather(self, location: str) -> Tuple[str, list]:
+    def _geocode(self, name: str) -> Optional[dict]:
         try:
             g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-                             params={"name": location, "count": 1}, timeout=10).json()
+                             params={"name": name, "count": 1}, timeout=10).json()
             hits = g.get("results") or []
-            if not hits:
+            return hits[0] if hits else None
+        except Exception:
+            return None
+
+    def _weather(self, location: str) -> Tuple[str, list]:
+        try:
+            # Open-Meteo geocoding wants a bare place name — "Boston, Massachusetts"
+            # returns 0 results, so fall back to the part before the first comma.
+            loc = self._geocode(location) or (self._geocode(location.split(",")[0].strip())
+                                              if "," in location else None)
+            if not loc:
                 return f"[weather: could not find '{location}']", []
-            loc = hits[0]
             name = ", ".join(x for x in [loc.get("name"), loc.get("admin1"), loc.get("country_code")] if x)
             w = requests.get("https://api.open-meteo.com/v1/forecast", params={
                 "latitude": loc["latitude"], "longitude": loc["longitude"],
@@ -117,14 +139,29 @@ class Pipe:
             return None
         return obj if obj.get("tool") in ("web_search", "weather") else None
 
-    async def _model(self, request, user, messages) -> str:
+    async def _extract_location(self, request, user, text: str) -> str:
+        out = await self._model(request, user, [
+            {"role": "system", "content": 'Extract the place the user is asking about. '
+             'Reply with ONLY JSON: {"location": "City, Region"} — or {"location": ""} if none.'},
+            {"role": "user", "content": text},
+        ])
+        m = _LOC_RE.search(out or "")
+        if not m:
+            return ""
+        try:
+            return (json.loads(m.group(0)).get("location") or "").strip()
+        except Exception:
+            return ""
+
+    async def _model(self, request, user, messages, think: Optional[bool] = None) -> str:
         model = self._loaded_model or self.valves.base_model
+        thinking = self.valves.enable_thinking if think is None else think
         async def call(mid):
             try:
                 resp = await generate_chat_completion(
                     request,
                     {"model": mid, "messages": messages, "stream": False,
-                     "chat_template_kwargs": {"enable_thinking": self.valves.enable_thinking}},
+                     "chat_template_kwargs": {"enable_thinking": thinking}},
                     user,
                 )
             except Exception as e:
@@ -155,8 +192,31 @@ class Pipe:
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": desc, "done": done}})
 
-        conv = [{"role": "system", "content": TOOL_DOC}] + list(body.get("messages", []))
+        base_msgs = list(body.get("messages", []))
+        conv = [{"role": "system", "content": TOOL_DOC}] + base_msgs
         sources, content = [], ""
+
+        # Deterministic weather routing: with thinking off, Qwen's "I can't do
+        # real-time weather" prior makes it refuse the weather tool. An extraction
+        # prompt doesn't trip that prior, so we pull the location and run the tool
+        # ourselves, seeding the result before the main loop.
+        last_user = next((m.get("content") for m in reversed(base_msgs)
+                          if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
+        weather_result = None  # fetched weather text, used as a hard fallback
+        if last_user and _WEATHER_INTENT.search(last_user):
+            loc = await self._extract_location(__request__, user, last_user)
+            if loc:
+                await emit(f"🔧 weather: {loc}")
+                result, _ = self._weather(loc)
+                if not result.startswith("["):
+                    weather_result = result
+                conv.append({"role": "assistant", "content": json.dumps({"tool": "weather", "location": loc})})
+                conv.append({"role": "user", "content":
+                    f"Here is the CURRENT, real-time weather, just fetched from a live source:\n{result}\n\n"
+                    "This data is accurate and up to date. Answer my previous question using it directly. "
+                    "Do NOT say you lack real-time access or that you cannot provide weather — you have it above. "
+                    "Do not output JSON."})
+
         for _ in range(self.valves.max_iterations):
             content = await self._model(__request__, user, conv)
             call = self._parse_call(content)
@@ -174,6 +234,13 @@ class Pipe:
 
         if not (content or "").strip():
             content = await self._model(__request__, user, [m for m in conv if m.get("role") != "system"]) or "…"
+
+        # Hard fallback: if we fetched valid weather but the model still hedged
+        # (no temperature in the reply, or a "can't/couldn't/unable" disclaimer),
+        # return the fetched data directly — it's already human-readable.
+        if weather_result and ("°" not in content
+                or re.search(r"\b(can'?t|cannot|couldn'?t|unable|do(?:n'?t| not) have|no access)\b", content, re.I)):
+            content = weather_result
 
         if sources:
             seen, uniq = set(), []
