@@ -2,6 +2,7 @@ import SwiftUI
 import CoreLocation
 import OpenWebUIKit
 import UserNotifications
+import AppIntents
 
 @MainActor
 final class AppState: ObservableObject {
@@ -258,6 +259,49 @@ final class LocationProvider: NSObject, ObservableObject, CLLocationManagerDeleg
     }
 
     nonisolated func locationManager(_ m: CLLocationManager, didFailWithError error: Error) {}
+}
+
+// MARK: - Action Button / Siri: start a voice conversation
+
+/// Shared launch signal between the App Intent (runs in-process when the intent
+/// fires) and the UI. The root view observes `requested` and presents the voice
+/// screen once the app is signed in; a request that arrives during cold launch is
+/// honored as soon as the main screen appears.
+@MainActor
+final class VoiceLaunch: ObservableObject {
+    static let shared = VoiceLaunch()
+    @Published var requested = false
+    func request() { requested = true }
+    func consume() { requested = false }
+}
+
+/// Assignable to the Action Button (Settings › Action Button › Shortcut) and to
+/// Siri: opens the app straight into a hands-free voice conversation.
+struct StartVoiceConversationIntent: AppIntent {
+    static var title: LocalizedStringResource = "Start Voice Conversation"
+    static var description = IntentDescription("Open OpenWebUI and start a hands-free voice conversation.")
+    static var openAppWhenRun = true
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        VoiceLaunch.shared.request()
+        return .result()
+    }
+}
+
+struct OpenWebUIShortcuts: AppShortcutsProvider {
+    static var appShortcuts: [AppShortcut] {
+        AppShortcut(
+            intent: StartVoiceConversationIntent(),
+            phrases: [
+                "Start a voice conversation in \(.applicationName)",
+                "Talk to \(.applicationName)",
+                "Open voice in \(.applicationName)",
+            ],
+            shortTitle: "Voice",
+            systemImageName: "waveform"
+        )
+    }
 }
 
 /// Local (on-device) notifications — used to ping when a chat reply finishes while

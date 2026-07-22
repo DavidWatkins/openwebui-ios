@@ -55,6 +55,8 @@ struct RootView: View {
     @EnvironmentObject private var app: AppState
     @EnvironmentObject private var themes: ThemeStore
     @Environment(\.theme) private var theme
+    @ObservedObject private var voiceLaunch = VoiceLaunch.shared
+    @State private var showVoice = false
 
     var body: some View {
         ZStack {
@@ -82,6 +84,19 @@ struct RootView: View {
             SpeechManager.shared.client = app.client   // enables server-side TTS
             await app.bootstrap()
         }
+        // Action Button / Siri → StartVoiceConversationIntent flips this. Present
+        // voice once signed in (a request during cold launch waits for .main).
+        #if os(iOS)
+        .fullScreenCover(isPresented: $showVoice) { VoiceView(app: app) }
+        .onChange(of: voiceLaunch.requested) { _, req in maybePresentVoice(req) }
+        .onChange(of: app.phase) { _, _ in maybePresentVoice(voiceLaunch.requested) }
+        #endif
+    }
+
+    private func maybePresentVoice(_ requested: Bool) {
+        guard requested, app.phase == .main else { return }
+        showVoice = true
+        voiceLaunch.consume()
     }
 }
 
