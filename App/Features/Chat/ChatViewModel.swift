@@ -313,6 +313,17 @@ final class ChatViewModel: ObservableObject {
             }
         }
         toolStatus = nil
+        // A buffered pipe reply can outlast the socket (it sends nothing for a
+        // minute, then the whole reply). If we caught no content over the socket,
+        // the answer is still persisted server-side — pull it back so it isn't lost.
+        if !sawContent, !Task.isCancelled,
+           let server = try? await client.chat(chatID),
+           let node = server.allMessages.first(where: { $0.id == assistant.id }),
+           !node.content.isEmpty {
+            setContent(assistant.id, node.content)
+            if let r = node.reasoning { setReasoning(assistant.id, r) }
+            sawContent = true
+        }
         isStreaming = false
         if !sawContent, let i = index(of: assistant.id), messages[i].content.isEmpty {
             messages[i].content = L("_(sem resposta)_")

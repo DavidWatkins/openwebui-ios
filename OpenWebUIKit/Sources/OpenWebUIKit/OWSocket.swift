@@ -64,6 +64,13 @@ public actor OWSocket {
         guard let url = comps.url else { throw OWError.transport("bad socket URL") }
 
         let cfg = URLSessionConfiguration.default
+        // A pipe/agent reply BUFFERS server-side (no token stream): the socket can
+        // sit silent for a minute or more, then deliver the whole reply at once.
+        // The default 60s request timeout kills `receive()` mid-generation, so the
+        // final event is lost — give the socket no idle timeout.
+        cfg.timeoutIntervalForRequest = 3600
+        cfg.timeoutIntervalForResource = 86_400
+        cfg.waitsForConnectivity = true
         let session = URLSession(configuration: cfg)
         self.session = session
         let task = session.webSocketTask(with: url)
