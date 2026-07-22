@@ -221,21 +221,26 @@ final class LocationProvider: NSObject, ObservableObject, CLLocationManagerDeleg
         manager.desiredAccuracy = kCLLocationAccuracyReduced   // city-level, not GPS-precise
     }
 
+    /// Cross-platform "location granted" check — `.authorizedWhenInUse` is iOS-only.
+    private static func granted(_ status: CLAuthorizationStatus) -> Bool {
+        #if os(iOS)
+        return status == .authorizedWhenInUse || status == .authorizedAlways
+        #else
+        return status == .authorizedAlways
+        #endif
+    }
+
     func setEnabled(_ on: Bool) {
         enabled = on
         guard on else { place = ""; return }
-        switch manager.authorizationStatus {
-        case .notDetermined: manager.requestWhenInUseAuthorization()
-        case .authorizedWhenInUse, .authorizedAlways: manager.requestLocation()
-        default: break   // denied/restricted — leave place empty
-        }
+        let status = manager.authorizationStatus
+        if status == .notDetermined { manager.requestWhenInUseAuthorization() }
+        else if Self.granted(status) { manager.requestLocation() }
     }
 
     /// Re-request once when leaving the app for a fresh fix (cheap, opt-in).
     func refresh() {
-        guard enabled,
-              manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways
-        else { return }
+        guard enabled, Self.granted(manager.authorizationStatus) else { return }
         manager.requestLocation()
     }
 
@@ -243,7 +248,7 @@ final class LocationProvider: NSObject, ObservableObject, CLLocationManagerDeleg
         let status = m.authorizationStatus
         Task { @MainActor in
             guard enabled else { return }
-            if status == .authorizedWhenInUse || status == .authorizedAlways { m.requestLocation() }
+            if Self.granted(status) { m.requestLocation() }
             else if status == .denied || status == .restricted { place = "" }
         }
     }

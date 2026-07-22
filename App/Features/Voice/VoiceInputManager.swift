@@ -29,10 +29,12 @@ final class VoiceInputManager: ObservableObject {
     @Published var spectrum: [Float] = Array(repeating: 0, count: VoiceInputManager.bandCount)
 
     // MARK: - FFT (Accelerate)
-    static let bandCount = 28
-    private static let fftLog2: vDSP_Length = 10                  // 1024-point FFT
-    private static let fftSetup: FFTSetup = vDSP_create_fftsetup(fftLog2, FFTRadix(kFFTRadix2))!
-    private static let hann: [Float] = {
+    // Immutable read-only setup shared with the nonisolated audio-thread FFT, so
+    // it's marked nonisolated (the class is @MainActor).
+    nonisolated static let bandCount = 28
+    nonisolated(unsafe) private static let fftLog2: vDSP_Length = 10       // 1024-point FFT
+    nonisolated(unsafe) private static let fftSetup: FFTSetup = vDSP_create_fftsetup(fftLog2, FFTRadix(kFFTRadix2))!
+    nonisolated(unsafe) private static let hann: [Float] = {
         var w = [Float](repeating: 0, count: 1 << Int(fftLog2))
         vDSP_hann_window(&w, vDSP_Length(w.count), Int32(vDSP_HANN_NORM))
         return w
