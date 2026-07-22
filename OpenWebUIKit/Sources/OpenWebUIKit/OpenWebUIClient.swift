@@ -193,6 +193,16 @@ public final class OpenWebUIClient: @unchecked Sendable {
         return decodeList(OWChatSummary.self, data)
     }
 
+    /// GET /api/v1/chats/search?text= — server-side full-text search across all the
+    /// user's chats (title + message content). Each result carries a `snippet`.
+    public func searchChats(_ text: String) async throws -> [OWChatSummary] {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+?#")
+        let q = text.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+        let data = try await send(request("/api/v1/chats/search?text=\(q)"))
+        return decodeList(OWChatSummary.self, data)
+    }
+
     /// GET /api/v1/chats/{id} — full chat with messages.
     public func chat(_ id: String) async throws -> OWChat {
         try decode(OWChat.self, try await send(request("/api/v1/chats/\(id)")))

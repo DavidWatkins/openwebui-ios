@@ -24,6 +24,7 @@ struct ChatListView: View {
     @State private var showWorkspace = false
     @State private var showImages = false
     @State private var search = ""
+    @State private var searchTask: Task<Void, Never>?
     /// Open a fresh chat on first launch (Claude-style), once per session.
     @State private var didAutoOpen = false
     @State private var renaming: OWChatSummary?
@@ -41,8 +42,13 @@ struct ChatListView: View {
     }
 
     private var filtered: [OWChatSummary] {
-        guard !search.isEmpty else { return store.chats }
-        return store.chats.filter { $0.title.localizedCaseInsensitiveContains(search) }
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return store.chats }
+        // Instant title matches over the loaded list, plus full-text results
+        // (server + cached bodies) from `store.search`, deduped.
+        let titleMatches = store.chats.filter { $0.title.localizedCaseInsensitiveContains(q) }
+        let ids = Set(titleMatches.map(\.id))
+        return titleMatches + store.searchResults.filter { !ids.contains($0.id) }
     }
 
     var body: some View {
@@ -160,6 +166,16 @@ struct ChatListView: View {
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .searchable(text: $search, prompt: "Buscar conversas")
+        .onChange(of: search) { _, q in
+            // Debounce: full-text search fires ~300ms after the last keystroke.
+            searchTask?.cancel()
+            let query = q
+            searchTask = Task {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if Task.isCancelled { return }
+                await store.search(query)
+            }
+        }
     }
 
     private func row(_ chat: OWChatSummary) -> some View {
@@ -171,6 +187,11 @@ struct ChatListView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(chat.title).font(.ody(.subheadline, design: .monospaced))
                     .foregroundStyle(theme.fg).lineLimit(1)
+                // A search match excerpt, when this row came from full-text search.
+                if let snippet = chat.snippet, !snippet.isEmpty {
+                    Text(snippet).font(.ody(size: 10, design: .monospaced))
+                        .foregroundStyle(theme.secondaryText).lineLimit(1)
+                }
                 if let ts = chat.updatedAt {
                     Text(RelativeDate.string(ts))
                         .font(.ody(size: 10, design: .monospaced)).foregroundStyle(theme.secondaryText)

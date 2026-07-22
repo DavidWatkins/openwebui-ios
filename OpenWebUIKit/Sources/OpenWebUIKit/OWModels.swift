@@ -287,17 +287,20 @@ public struct OWChatSummary: Decodable, Identifiable, Hashable, Sendable {
     /// server. Never decoded from the API — set by the local store. The custom
     /// decoder below leaves it at its `false` default for server chats.
     public var isLocal: Bool = false
+    /// A matching excerpt, when this summary came from a full-text search
+    /// (the server's `/chats/search` snippet, or a local excerpt). Else nil.
+    public var snippet: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, title, updated_at, created_at, pinned, archived
+        case id, title, updated_at, created_at, pinned, archived, snippet
     }
 
     public init(id: String, title: String, updatedAt: Double? = nil,
                 createdAt: Double? = nil, pinned: Bool = false, archived: Bool = false,
-                isLocal: Bool = false) {
+                isLocal: Bool = false, snippet: String? = nil) {
         self.id = id; self.title = title; self.updatedAt = updatedAt
         self.createdAt = createdAt; self.pinned = pinned; self.archived = archived
-        self.isLocal = isLocal
+        self.isLocal = isLocal; self.snippet = snippet
     }
 
     public init(from decoder: Decoder) throws {
@@ -310,6 +313,7 @@ public struct OWChatSummary: Decodable, Identifiable, Hashable, Sendable {
         createdAt = try? c.decode(Double.self, forKey: .created_at)
         pinned = (try? c.decode(Bool.self, forKey: .pinned)) ?? false
         archived = (try? c.decode(Bool.self, forKey: .archived)) ?? false
+        snippet = (try? c.decodeIfPresent(String.self, forKey: .snippet))?.flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 

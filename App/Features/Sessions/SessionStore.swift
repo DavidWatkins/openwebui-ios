@@ -8,6 +8,8 @@ final class ChatStore: ObservableObject {
     @Published var chats: [OWChatSummary] = []
     @Published var loading = false
     @Published var error: String?
+    /// Full-text search results (title + message content). Populated by `search`.
+    @Published var searchResults: [OWChatSummary] = []
 
     private let client: OpenWebUIClient
     private let localStore: LocalChatStore
@@ -47,6 +49,22 @@ final class ChatStore: ObservableObject {
             chats = sorted(local + localStore.cachedSummaries())
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    /// Full-text search: server-side (all chats, with snippets) when reachable,
+    /// merged with local device/cached matches; local-only when offline.
+    func search(_ text: String) async {
+        let q = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { searchResults = []; return }
+        let local = localStore.search(q)
+        var merged = local
+        if let server = try? await client.searchChats(q) {
+            if Task.isCancelled { return }
+            let serverIDs = Set(server.map(\.id))
+            merged = server + local.filter { !serverIDs.contains($0.id) }
+        }
+        if Task.isCancelled { return }
+        searchResults = merged
     }
 
     func delete(_ chat: OWChatSummary) async {
@@ -346,5 +364,44 @@ final class LocalChatStore {
     func deleteCached(id: String) {
         guard let e = cached(id: id) else { return }
         ctx.delete(e); try? ctx.save()
+    }
+
+    // MARK: - Local full-text search (offline / device chats)
+
+    /// Full-text search over on-device local chats + cached server chats. Matches
+    /// title or any message body; returns summaries with a matching `snippet`.
+    func search(_ text: String) -> [OWChatSummary] {
+        let q = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return [] }
+        var out: [OWChatSummary] = []
+        for c in all() {
+            if let snip = Self.match(title: c.title, bodies: c.messages.map(\.content), query: q) {
+                out.append(OWChatSummary(id: c.id, title: c.title, updatedAt: c.updatedAt,
+                    createdAt: c.createdAt, pinned: false, archived: false, isLocal: true, snippet: snip))
+            }
+        }
+        let d = FetchDescriptor<CachedServerChat>(sortBy: [SortDescriptor(\.updatedAt, order: .reverse)])
+        for c in (try? ctx.fetch(d)) ?? [] where c.hasHistory {
+            if let snip = Self.match(title: c.title, bodies: c.tree.map(\.content), query: q) {
+                out.append(OWChatSummary(id: c.id, title: c.title, updatedAt: c.updatedAt,
+                    createdAt: c.createdAt, pinned: c.pinned, archived: c.archived, isLocal: false, snippet: snip))
+            }
+        }
+        return out
+    }
+
+    /// Returns a short excerpt around the first body match (or the title itself if
+    /// only the title matched), or nil when nothing matches.
+    private static func match(title: String, bodies: [String], query: String) -> String? {
+        for body in bodies {
+            let lower = body.lowercased()
+            if let r = lower.range(of: query) {
+                let start = body.index(r.lowerBound, offsetBy: -40, limitedBy: body.startIndex) ?? body.startIndex
+                let end = body.index(r.upperBound, offsetBy: 60, limitedBy: body.endIndex) ?? body.endIndex
+                let excerpt = body[start..<end].replacingOccurrences(of: "\n", with: " ")
+                return (start > body.startIndex ? "…" : "") + excerpt + (end < body.endIndex ? "…" : "")
+            }
+        }
+        return title.lowercased().contains(query) ? title : nil
     }
 }
