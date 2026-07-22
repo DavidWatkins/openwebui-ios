@@ -70,6 +70,13 @@ final class AppState: ObservableObject {
     }
     let locationProvider = LocationProvider()
 
+    /// Remember durable facts about the user across chats (Open WebUI Memory).
+    @Published var memoryEnabled: Bool {
+        didSet { UserDefaults.standard.set(memoryEnabled, forKey: "ctx.memory") }
+    }
+    /// The user's stored memories (loaded from the server), injected into context.
+    @Published var memories: [OWMemory] = []
+
     /// Tools available by default for a new chat (all minus the disabled ones).
     func enabledToolIDs() -> Set<String> {
         Set(tools.map(\.id)).subtracting(disabledToolIDs)
@@ -90,8 +97,48 @@ final class AppState: ObservableObject {
         if !loc.isEmpty { parts.append("The user's location: \(loc).") }
         let inst = customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         if !inst.isEmpty { parts.append("User instructions: \(inst)") }
+        if memoryEnabled, !memories.isEmpty {
+            let facts = memories.prefix(30).map { "- \($0.content)" }.joined(separator: "\n")
+            parts.append("What you remember about the user:\n\(facts)")
+        }
         guard !parts.isEmpty else { return nil }
         return OWChatMessageInput(role: "system", text: parts.joined(separator: "\n"))
+    }
+
+    // MARK: - Memory (Open WebUI)
+
+    /// A base (non-pipe) model for background tasks (title, memory extraction).
+    private func baseModelID() -> String? {
+        if let id = preferredModelID, !id.hasPrefix("agent") { return id }
+        return models.first { !$0.id.hasPrefix("agent") }?.id
+    }
+
+    func loadMemories() async {
+        guard memoryEnabled else { memories = []; return }
+        memories = (try? await client.memories()) ?? memories
+    }
+
+    func deleteMemory(_ m: OWMemory) async {
+        try? await client.deleteMemory(m.id)
+        memories.removeAll { $0.id == m.id }
+    }
+
+    func clearMemories() async {
+        for m in memories { try? await client.deleteMemory(m.id) }
+        memories = []
+    }
+
+    /// After a completed exchange, extract any new durable user-facts and store
+    /// them (background, best-effort) so the assistant remembers across chats.
+    func remember(userText: String, replyText: String) {
+        guard memoryEnabled, !userText.isEmpty, !replyText.isEmpty, let model = baseModelID() else { return }
+        Task {
+            let facts = await client.extractMemories(model: model, userText: userText,
+                                                     replyText: replyText, existing: memories.map(\.content))
+            guard !facts.isEmpty else { return }
+            for f in facts { try? await client.addMemory(f) }
+            await loadMemories()
+        }
     }
 
     let client: OpenWebUIClient
@@ -114,6 +161,7 @@ final class AppState: ObservableObject {
         self.userLocation = d.string(forKey: "ctx.location") ?? ""
         self.includeDateTime = (d.object(forKey: "ctx.datetime") as? Bool) ?? true
         self.useDeviceLocation = d.bool(forKey: "ctx.useGPS")
+        self.memoryEnabled = (d.object(forKey: "ctx.memory") as? Bool) ?? true
         locationProvider.setEnabled(useDeviceLocation)
     }
 
@@ -128,6 +176,7 @@ final class AppState: ObservableObject {
             await loadModels()
             phase = .main
             LocalNotifier.requestAuthorization()
+            Task { await loadMemories() }
         } catch {
             phase = .login
         }
@@ -198,6 +247,10 @@ final class AppState: ObservableObject {
                                initialToolIDs: enabledToolIDs())
         // Evaluated at send time so date/time stays current and edits take effect.
         vm.contextProvider = { [weak self] in self?.contextSystemMessage() }
+        // After each reply, learn durable facts about the user (background).
+        vm.onReplyComplete = { [weak self] userText, replyText in
+            self?.remember(userText: userText, replyText: replyText)
+        }
         return vm
     }
 }

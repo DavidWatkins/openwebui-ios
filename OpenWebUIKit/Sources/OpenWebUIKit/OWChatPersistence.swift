@@ -219,10 +219,39 @@ extension OpenWebUIClient {
         return Self.cleanTitle(raw)
     }
 
-    private static func cooldownModel(_ detail: String) -> String? {
+    static func cooldownModel(_ detail: String) -> String? {
         // "router cooldown: qwen3.6-27b loaded 41s ago, will not swap to …"
         guard let r = detail.range(of: #"cooldown:\s*(\S+)\s+loaded"#, options: .regularExpression) else { return nil }
         return detail[r].split(separator: " ").dropFirst().first.map(String.init)
+    }
+
+    /// A single thinking-off completion, returning the assistant text (nil on any
+    /// failure), with router-cooldown retry. Shared by title generation + memory
+    /// extraction. `model` should be a base model, not a pipe.
+    func oneShotCompletion(model: String, system: String, user: String) async -> String? {
+        func attempt(_ mid: String) async -> (raw: String?, cooldown: String?) {
+            let body: [String: Any] = [
+                "model": mid, "stream": false,
+                "chat_template_kwargs": ["enable_thinking": false],
+                "messages": [["role": "system", "content": system],
+                             ["role": "user", "content": user]],
+            ]
+            var req = request("/api/chat/completions", method: "POST")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            do {
+                let data = try await send(req)
+                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let content = (((obj?["choices"] as? [[String: Any]])?.first?["message"]) as? [String: Any])?["content"] as? String
+                return (content, nil)
+            } catch let OWError.http(_, detail) {
+                if let d = detail, let m = Self.cooldownModel(d) { return (nil, m) }
+                return (nil, nil)
+            } catch { return (nil, nil) }
+        }
+        var r = await attempt(model)
+        if let loaded = r.cooldown { r = await attempt(loaded) }
+        return r.raw
     }
 
     private static func cleanTitle(_ raw: String) -> String? {

@@ -210,3 +210,8 @@
 "Regenerar" = "Yeniden oluştur";
 "Editar mensagem" = "Mesajı düzenle";
 "Enviar" = "Gönder";
+"Memória" = "Bellek";
+"Lembra fatos sobre você entre conversas." = "Sohbetler arasında hakkınızdaki bilgileri hatırlar.";
+"Gerenciar memórias" = "Bellekleri yönet";
+"Nenhuma memória ainda. À medida que você conversa, o assistente lembra fatos duráveis sobre você aqui." = "Henüz bellek yok. Sohbet ettikçe asistan hakkınızdaki kalıcı bilgileri burada hatırlar.";
+"Limpar tudo" = "Tümünü temizle";

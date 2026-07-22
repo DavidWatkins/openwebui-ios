@@ -99,6 +99,24 @@ struct SettingsView: View {
                             Text("Incluir data e hora").font(.ody(.body, design: .monospaced)).foregroundStyle(theme.fg)
                         }
                         .tint(theme.accent).listRowBackground(theme.panel)
+                        Toggle(isOn: Binding(get: { app.memoryEnabled }, set: { app.memoryEnabled = $0; if $0 { Task { await app.loadMemories() } } })) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Memória").font(.ody(.body, design: .monospaced)).foregroundStyle(theme.fg)
+                                Text("Lembra fatos sobre você entre conversas.")
+                                    .font(.ody(.caption, design: .monospaced)).foregroundStyle(theme.secondaryText)
+                            }
+                        }
+                        .tint(theme.accent).listRowBackground(theme.panel)
+                        if app.memoryEnabled {
+                            NavigationLink { MemoryListView().environmentObject(app) } label: {
+                                HStack {
+                                    Text("Gerenciar memórias").font(.ody(.body, design: .monospaced)).foregroundStyle(theme.fg)
+                                    Spacer()
+                                    Text("\(app.memories.count)").font(.ody(.body, design: .monospaced)).foregroundStyle(theme.secondaryText)
+                                }
+                            }
+                            .listRowBackground(theme.panel)
+                        }
                     }
 
                     if !app.tools.isEmpty {
@@ -303,5 +321,41 @@ struct DefaultModelPickerView: View {
             }
         }
         .listRowBackground(theme.panel)
+    }
+}
+
+/// View, delete, and clear the assistant's memories about you.
+struct MemoryListView: View {
+    @EnvironmentObject private var app: AppState
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        List {
+            if app.memories.isEmpty {
+                Text("Nenhuma memória ainda. À medida que você conversa, o assistente lembra fatos duráveis sobre você aqui.")
+                    .font(.ody(.footnote, design: .monospaced)).foregroundStyle(theme.secondaryText)
+                    .listRowBackground(theme.panel)
+            } else {
+                ForEach(app.memories) { m in
+                    Text(m.content).font(.ody(.body, design: .monospaced)).foregroundStyle(theme.fg)
+                        .listRowBackground(theme.panel)
+                        .swipeActions {
+                            Button(role: .destructive) { Task { await app.deleteMemory(m) } } label: {
+                                Label("Apagar", systemImage: "trash")
+                            }
+                        }
+                }
+                Button(role: .destructive) { Task { await app.clearMemories() } } label: {
+                    Text("Limpar tudo").font(.ody(.body, design: .monospaced))
+                }
+                .listRowBackground(theme.panel)
+            }
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(theme.bg)
+        .navigationTitle("Memória")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await app.loadMemories() }
     }
 }

@@ -45,6 +45,9 @@ final class ChatViewModel: ObservableObject {
     private(set) var chatID: String?
     /// Fired after a turn finishes so the list can refresh.
     var onChanged: (() -> Void)?
+    /// Fired after a reply completes with (last user text, reply text) — drives
+    /// cross-chat memory extraction.
+    var onReplyComplete: ((String, String) -> Void)?
     /// Supplies the ambient-context system message (date/time, location, custom
     /// instructions) to prepend to each turn. Evaluated per-send so it stays live.
     var contextProvider: (() -> OWChatMessageInput?)?
@@ -352,6 +355,10 @@ final class ChatViewModel: ObservableObject {
         notifyReplyIfBackgrounded(assistant.id)
         // The socket flow already persisted the reply server-side; just refresh.
         onChanged?()
+        if sawContent, let reply = messages.first(where: { $0.id == assistant.id })?.content {
+            let lastUser = messages.last { $0.role == .user }?.content ?? ""
+            onReplyComplete?(lastUser, reply)
+        }
         if isNewChat, sawContent { await autoTitle(assistantID: assistant.id) }
     }
 

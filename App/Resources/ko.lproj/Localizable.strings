@@ -210,3 +210,8 @@
 "Regenerar" = "다시 생성";
 "Editar mensagem" = "메시지 편집";
 "Enviar" = "보내기";
+"Memória" = "메모리";
+"Lembra fatos sobre você entre conversas." = "대화 간에 당신에 대한 사실을 기억합니다.";
+"Gerenciar memórias" = "메모리 관리";
+"Nenhuma memória ainda. À medida que você conversa, o assistente lembra fatos duráveis sobre você aqui." = "아직 메모리가 없습니다. 대화하면서 어시스턴트가 당신에 대한 지속적인 사실을 여기에 기억합니다.";
+"Limpar tudo" = "모두 지우기";
