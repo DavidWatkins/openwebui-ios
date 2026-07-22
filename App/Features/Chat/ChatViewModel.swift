@@ -299,6 +299,7 @@ final class ChatViewModel: ObservableObject {
             switch update {
             case .content(let full):
                 sawContent = true
+                toolStatus = nil                 // answer is arriving → tools are done
                 setContent(assistant.id, full)   // cumulative → replace, not append
             case .reasoning(let full):
                 setReasoning(assistant.id, full) // cumulative → replace, not append

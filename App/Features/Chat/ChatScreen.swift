@@ -127,27 +127,22 @@ struct ChatScreen: View {
                 }
                 LazyVStack(spacing: 16) {
                     ForEach(Array(vm.messages.enumerated()), id: \.element.id) { idx, msg in
+                        let streaming = vm.isStreaming && idx == vm.messages.count - 1 && msg.role == .assistant
                         MessageBubble(
                             message: msg,
-                            isStreaming: vm.isStreaming && idx == vm.messages.count - 1 && msg.role == .assistant,
+                            isStreaming: streaming,
                             client: app.client,
                             branch: vm.branchInfo(for: msg.id),
                             models: app.models,
+                            // Tool activity ("🔧 web_search: …") shows inline under this
+                            // reply while it runs — only on the message being generated.
+                            toolStatus: streaming ? vm.toolStatus : nil,
                             onEdit: msg.role == .user ? { vm.editUser(messageID: msg.id, newText: $0) } : nil,
                             onRegenerate: msg.role == .assistant ? { vm.regenerate(messageID: msg.id) } : nil,
                             onRetryModel: msg.role == .assistant ? { vm.regenerate(messageID: msg.id, model: $0) } : nil,
                             onBranch: { vm.switchBranch(messageID: msg.id, delta: $0) }
                         )
                         .id(msg.id)
-                    }
-                    if let status = vm.toolStatus {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.mini)
-                            Text(status).font(.ody(size: 12, design: .monospaced)).foregroundStyle(theme.secondaryText)
-                            Spacer()
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .transition(.opacity)
                     }
                 }
                 .padding(.horizontal, 14).padding(.vertical, 16)

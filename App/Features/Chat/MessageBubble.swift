@@ -13,6 +13,8 @@ struct MessageBubble: View {
     var branch: (index: Int, total: Int)? = nil
     /// Models offered in the "retry with a different model" menu.
     var models: [OWModel] = []
+    /// Live tool activity for the message being generated ("🔧 web_search: …").
+    var toolStatus: String? = nil
     var onEdit: ((String) -> Void)? = nil          // edited user text
     var onRegenerate: (() -> Void)? = nil
     var onRetryModel: ((String) -> Void)? = nil    // model id
@@ -39,10 +41,23 @@ struct MessageBubble: View {
     /// streaming, and a placeholder for a truly-empty message with nothing else.
     private var showBubble: Bool {
         if !message.content.isEmpty { return true }
-        if isStreaming { return true }
+        // content empty & streaming: only show the typing bubble when nothing else
+        // already signals activity (reasoning disclosure or a running tool) — that
+        // empty bubble between the thinking and the "Searching…" row was the artifact.
+        if isStreaming { return message.reasoning == nil && toolStatus == nil }
         // content empty & settled: only a bare message (no reasoning/images/docs)
         // gets a placeholder; a reasoning-only reply shows just the disclosure.
         return message.reasoning == nil && message.imageURLs.isEmpty && message.documents.isEmpty
+    }
+
+    private func toolStatusRow(_ status: String) -> some View {
+        HStack(spacing: 6) {
+            ProgressView().controlSize(.mini)
+            Text(status).font(.ody(size: 12, design: .monospaced))
+                .foregroundStyle(theme.secondaryText)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .transition(.opacity)
     }
     private var reasoningExpanded: Bool { reasoningOverride ?? isThinking }
 
@@ -52,6 +67,7 @@ struct MessageBubble: View {
             VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
                 if !isUser { header }
                 if !isUser, let reasoning = message.reasoning { reasoningView(reasoning) }
+                if let toolStatus { toolStatusRow(toolStatus) }
                 if !message.imageURLs.isEmpty { imagesView }
                 if !message.documents.isEmpty { documentsView }
                 if editing {
