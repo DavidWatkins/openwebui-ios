@@ -1,5 +1,8 @@
 import SwiftUI
 import OpenWebUIKit
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @MainActor
 final class ChatViewModel: ObservableObject {
@@ -255,6 +258,12 @@ final class ChatViewModel: ObservableObject {
             await runStream(model: model, convo: convo, files: files, assistantID: assistant.id); return
         }
 
+        // Keep the app alive briefly if it's backgrounded mid-reply so we can catch
+        // the finish and post a local notification. The reply persists server-side
+        // regardless, so if the window expires the answer is still safe on reload.
+        beginBackgroundHold()
+        defer { endBackgroundHold() }
+
         var sawContent = false
         let options = OWStreamOptions(webSearch: webSearch, imageGeneration: imageGeneration,
                                       codeInterpreter: codeInterpreter, toolIDs: Array(selectedToolIDs))
@@ -282,6 +291,7 @@ final class ChatViewModel: ObservableObject {
         if !sawContent, let i = index(of: assistant.id), messages[i].content.isEmpty {
             messages[i].content = L("_(sem resposta)_")
         }
+        notifyReplyIfBackgrounded(assistant.id)
         // The socket flow already persisted the reply server-side; just refresh.
         onChanged?()
     }
@@ -458,4 +468,40 @@ final class ChatViewModel: ObservableObject {
     private func setReasoning(_ id: String, _ text: String) {
         if let i = index(of: id) { messages[i].reasoning = text }
     }
+
+    // MARK: - Background completion + local notification
+
+    /// Post a local notification if the reply finished while the app was backgrounded
+    /// — so a mid-stream reply the user walked away from pings them when it's ready.
+    private func notifyReplyIfBackgrounded(_ id: String) {
+        #if canImport(UIKit)
+        guard UIApplication.shared.applicationState == .background else { return }
+        guard let i = index(of: id) else { return }
+        let body = messages[i].content
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return }
+        let snippet = body.count > 140 ? String(body.prefix(140)) + "…" : body
+        let heading = title.isEmpty ? L("Resposta pronta") : title
+        LocalNotifier.replyFinished(title: heading, body: snippet, threadID: chatID)
+        #endif
+    }
+
+    #if canImport(UIKit)
+    private var backgroundHold: UIBackgroundTaskIdentifier = .invalid
+    private func beginBackgroundHold() {
+        endBackgroundHold()
+        backgroundHold = UIApplication.shared.beginBackgroundTask(withName: "chat-reply") { [weak self] in
+            self?.endBackgroundHold()
+        }
+    }
+    private func endBackgroundHold() {
+        guard backgroundHold != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundHold)
+        backgroundHold = .invalid
+    }
+    #else
+    private func beginBackgroundHold() {}
+    private func endBackgroundHold() {}
+    #endif
 }

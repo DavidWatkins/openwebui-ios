@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreLocation
 import OpenWebUIKit
+import UserNotifications
 
 @MainActor
 final class AppState: ObservableObject {
@@ -125,6 +126,7 @@ final class AppState: ObservableObject {
             user = try await client.me()
             await loadModels()
             phase = .main
+            LocalNotifier.requestAuthorization()
         } catch {
             phase = .login
         }
@@ -138,6 +140,7 @@ final class AppState: ObservableObject {
             keychain.saveCredentials(email: email, password: nil)   // remember email only
             await loadModels()
             phase = .main
+            LocalNotifier.requestAuthorization()
         } catch {
             loginError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -255,4 +258,25 @@ final class LocationProvider: NSObject, ObservableObject, CLLocationManagerDeleg
     }
 
     nonisolated func locationManager(_ m: CLLocationManager, didFailWithError error: Error) {}
+}
+
+/// Local (on-device) notifications — used to ping when a chat reply finishes while
+/// the app is backgrounded. No push server or APNs: `UNUserNotificationCenter`
+/// posts these itself. Colocated here to avoid a new project file.
+enum LocalNotifier {
+    static func requestAuthorization() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
+
+    /// Fire a notification for a finished reply. `threadID` (the chat id) collapses
+    /// repeat pings for the same chat into one thread.
+    static func replyFinished(title: String, body: String, threadID: String?) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        if let threadID { content.threadIdentifier = threadID }
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
 }
