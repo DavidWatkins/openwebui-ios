@@ -145,7 +145,12 @@ final class VoiceInputManager: ObservableObject {
 
         input.installTap(onBus: 0, bufferSize: 8192, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
-            let lvl = Self.rms(buffer)
+            // Raw RMS of float PCM speech is tiny (~0.02–0.08), and `.measurement`
+            // mode disables input gain — far below what the orb needs to visibly
+            // react or what energy-endpointing can threshold. Boost to a usable
+            // 0…1 range (perceptual: emphasise the quiet end so a normal voice
+            // clearly registers).
+            let lvl = min(1, Self.rms(buffer).squareRoot() * 1.6)
             Task { @MainActor in self.level = lvl }
             if self.captureToModel { self.captureRaw(buffer) }
             else { self.request?.append(buffer) }

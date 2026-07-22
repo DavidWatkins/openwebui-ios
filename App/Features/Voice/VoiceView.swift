@@ -72,6 +72,8 @@ struct VoiceView: View {
             convo.onCommit = onCommit   // route turns into the host chat
             if let seed { convo.seedOnce(chatID: seed.chatID, messages: seed.messages, model: seed.model) }
             else if !convo.active { convo.reset() }
+            // Auto-start listening on open, ChatGPT-style — no manual "Iniciar".
+            if !convo.active { Task { await convo.startSession() } }
         }
     }
 

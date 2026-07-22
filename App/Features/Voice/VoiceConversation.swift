@@ -53,7 +53,9 @@ final class VoiceConversation: ObservableObject {
     // Energy-based endpointing (for engines with no live transcript).
     private var heardSpeech = false
     private var lastLoud = Date()
-    private let speechLevel: Float = 0.04
+    // Matched to VoiceInputManager's boosted 0…1 level: a normal voice reads
+    // ~0.35–0.6, room noise ~0.05–0.15, so this cleanly separates speech.
+    private let speechLevel: Float = 0.22
     private var sttIsNative: Bool {
         let e = UserDefaults.standard.string(forKey: "voice.stt.engine")
         return e != "model" && e != "server"
@@ -217,7 +219,7 @@ final class VoiceConversation: ObservableObject {
         // Throttle UI churn: only republish on a meaningful change so the orb's
         // (blur/shadow) layers don't re-render on every audio callback.
         let next: Float = (phase == .listening) ? lvl : 0
-        if abs(next - level) > 0.04 { level = next }
+        if abs(next - level) > 0.02 { level = next }
         guard phase == .listening else { return }
         if lvl > speechLevel { heardSpeech = true; lastLoud = Date() }
     }
