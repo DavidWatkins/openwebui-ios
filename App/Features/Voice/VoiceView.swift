@@ -105,8 +105,10 @@ struct VoiceView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 4)
             }
-            .onChange(of: convo.turns.count) { _, _ in withAnimation { proxy.scrollTo("bottom") } }
-            .onChange(of: convo.reply) { _, _ in proxy.scrollTo("bottom") }
+            .onChange(of: convo.turns.count) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            .onChange(of: convo.reply) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
+            // Keep your live transcription in view above the dock as you speak.
+            .onChange(of: convo.liveText) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
         }
     }
 
