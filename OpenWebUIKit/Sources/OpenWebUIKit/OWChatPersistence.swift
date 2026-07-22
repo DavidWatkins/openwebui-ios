@@ -86,4 +86,73 @@ extension OpenWebUIClient {
         let req = try jsonRequest("/api/v1/chats/\(encPath(id))", method: "POST", body: ["chat": payload])
         _ = try await send(req)
     }
+
+    /// Renames a chat without touching its messages (avoids clobbering branches).
+    public func renameChat(id: String, title: String) async throws {
+        let req = try jsonRequest("/api/v1/chats/\(encPath(id))", method: "POST",
+                                  body: ["chat": ["title": title]])
+        _ = try await send(req)
+    }
+
+    /// Generates a short semantic title for a new chat from its first exchange —
+    /// like the web UI's auto-title, but as a plain base-model completion with
+    /// thinking OFF (fast, ~1s) since Open WebUI's title task endpoint ignores
+    /// `enable_thinking` and the reasoning models otherwise burn the token budget
+    /// on thinking and return nothing. `model` should be a base model, not a pipe;
+    /// the router swap-cooldown is auto-handled by retrying with the loaded model.
+    /// Returns nil on any failure so the caller keeps its fallback title.
+    public func generateTitle(model: String, conversation: String) async -> String? {
+        let prompt = """
+        Create a short 3-5 word title (you may add one leading emoji) that summarizes \
+        the topic of this conversation. Output ONLY the title, nothing else.
+
+        <conversation>
+        \(conversation)
+        </conversation>
+        """
+        func attempt(_ mid: String) async -> (raw: String?, cooldown: String?) {
+            let body: [String: Any] = [
+                "model": mid, "stream": false,
+                "chat_template_kwargs": ["enable_thinking": false],
+                "messages": [["role": "user", "content": prompt]],
+            ]
+            var req = request("/api/chat/completions", method: "POST")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            do {
+                let data = try await send(req)
+                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let content = (((obj?["choices"] as? [[String: Any]])?.first?["message"]) as? [String: Any])?["content"] as? String
+                return (content, nil)
+            } catch let OWError.http(_, detail) {
+                // Router refused a swap → the detail names the loaded model.
+                if let d = detail, let m = Self.cooldownModel(d) { return (nil, m) }
+                return (nil, nil)
+            } catch {
+                return (nil, nil)
+            }
+        }
+        var result = await attempt(model)
+        if let loaded = result.cooldown { result = await attempt(loaded) }
+        guard let raw = result.raw else { return nil }
+        return Self.cleanTitle(raw)
+    }
+
+    private static func cooldownModel(_ detail: String) -> String? {
+        // "router cooldown: qwen3.6-27b loaded 41s ago, will not swap to …"
+        guard let r = detail.range(of: #"cooldown:\s*(\S+)\s+loaded"#, options: .regularExpression) else { return nil }
+        return detail[r].split(separator: " ").dropFirst().first.map(String.init)
+    }
+
+    private static func cleanTitle(_ raw: String) -> String? {
+        var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        t = t.split(separator: "\n").first.map(String.init) ?? t
+        if let r = t.range(of: #"^\s*title\s*:\s*"#, options: [.regularExpression, .caseInsensitive]) {
+            t.removeSubrange(r)
+        }
+        t = t.trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'“”"))
+        // Reject a model that answered the question instead of titling.
+        guard !t.isEmpty, t.count <= 60 else { return nil }
+        return t
+    }
 }

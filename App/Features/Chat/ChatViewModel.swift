@@ -240,6 +240,7 @@ final class ChatViewModel: ObservableObject {
     /// chat can't be prepared.
     private func runSocketTurn(model: String, convo: [OWChatMessageInput],
                                files: [OWAttachment], assistant: OWMessage) async {
+        let isNewChat = chatID == nil
         do {
             let title = chatTitle()
             if let id = chatID {
@@ -294,6 +295,7 @@ final class ChatViewModel: ObservableObject {
         notifyReplyIfBackgrounded(assistant.id)
         // The socket flow already persisted the reply server-side; just refresh.
         onChanged?()
+        if isNewChat, sawContent { await autoTitle(assistantID: assistant.id) }
     }
 
     /// Image-generation turn: the prompt goes to the server's image engine
@@ -425,6 +427,31 @@ final class ChatViewModel: ObservableObject {
             return String(first.prefix(50))
         }
         return title
+    }
+
+    /// After a new chat's first reply, replace the truncated placeholder with a
+    /// short LLM-generated title (like the web UI / Claude). Best-effort: on any
+    /// failure the first-message title stays. Runs only for server chats.
+    private func autoTitle(assistantID: String) async {
+        guard let id = chatID, mode == .server else { return }
+        let user = messages.first { $0.role == .user }?.content ?? ""
+        let reply = messages.first { $0.id == assistantID }?.content ?? ""
+        guard !user.isEmpty else { return }
+        let convo = "User: \(user.prefix(600))\nAssistant: \(reply.prefix(600))"
+        guard let model = titleModel(),
+              let generated = await client.generateTitle(model: model, conversation: convo),
+              !Task.isCancelled else { return }
+        title = generated
+        try? await client.renameChat(id: id, title: generated)
+        onChanged?()
+    }
+
+    /// A base (non-pipe) model for the title call — the agent pipe would run its
+    /// whole tool loop just to name a chat. Prefer the chat's own model if it's a
+    /// base model, else the first non-`agent` model the server offers.
+    private func titleModel() -> String? {
+        if let m = selectedModel, !m.hasPrefix("agent") { return m }
+        return models.first { !$0.id.hasPrefix("agent") }?.id
     }
 
     func stop() {
