@@ -110,6 +110,16 @@ final class VoiceConversation: ObservableObject {
         if active { stop() } else { Task { await startSession() } }
     }
 
+    /// Mute/unmute the mic without ending the session (ChatGPT-style). While muted
+    /// the input is discarded and endpointing is paused.
+    @Published var muted = false
+    func toggleMute() {
+        muted.toggle()
+        voice.muted = muted
+        if muted { liveText = "" }        // drop the in-progress partial
+        else { lastChange = Date(); lastLoud = Date() }   // reset the pause clock
+    }
+
     /// Loads an existing server chat so voice continues it (one-time, used when
     /// opening the voice screen from a chat's voice button). Carries the chat's
     /// model and its saved per-conversation voice.
@@ -228,7 +238,7 @@ final class VoiceConversation: ObservableObject {
     }
 
     private func checkSilence() {
-        guard phase == .listening else { return }
+        guard phase == .listening, !muted else { return }
         if sttIsNative {
             // Native has a live transcript — end on a pause after real words.
             guard !lastPartial.isEmpty else { return }

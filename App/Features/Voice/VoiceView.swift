@@ -192,20 +192,35 @@ struct VoiceView: View {
 
     // MARK: - Controls
 
+    /// ChatGPT-style bottom controls: mute (left), exit (right). The session
+    /// auto-starts, so there's no explicit "start" — tapping mute or the orb
+    /// manages the mic; exit ends it. If nothing's running, mute doubles as start.
     private var controlButton: some View {
-        Button { convo.toggleSession() } label: {
-            HStack(spacing: 8) {
-                Image(systemName: convo.active ? "stop.fill" : "mic.fill")
-                Text(LocalizedStringKey(convo.active ? "Encerrar" : "Iniciar conversa"))
-                    .font(.ody(.headline, design: .monospaced))
+        HStack {
+            circleControl(convo.muted ? "mic.slash.fill" : "mic.fill",
+                          on: convo.muted) {
+                if !convo.active { Task { await convo.startSession() } }
+                else { convo.toggleMute() }
             }
-            .frame(maxWidth: .infinity).padding(.vertical, 15)
-            .background(convo.active ? theme.panel : theme.accent,
-                        in: RoundedRectangle(cornerRadius: 14))
-            .foregroundStyle(convo.active ? theme.accent : .white)
-            .overlay(RoundedRectangle(cornerRadius: 14)
-                .stroke(convo.active ? theme.accent : .clear, lineWidth: 1))
+            Spacer()
+            circleControl("xmark", on: false) {
+                convo.stop()
+                dismiss()
+            }
         }
+        .padding(.horizontal, 24)
+    }
+
+    private func circleControl(_ system: String, on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: system)
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(on ? .white : theme.fg)
+                .frame(width: 60, height: 60)
+                .background(on ? theme.accent : theme.panel, in: Circle())
+                .overlay(Circle().stroke(theme.border.opacity(0.5), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
 
     private var modelPicker: some View {

@@ -66,6 +66,9 @@ final class VoiceInputManager: ObservableObject {
     /// Injected at startup — required for the "server" STT engine.
     var client: OpenWebUIClient?
 
+    /// While true the mic tap discards audio (session stays alive) — drives mute.
+    var muted = false
+
     init() {
         #if os(iOS)
         // Free the loaded Whisper model (100s of MB–1 GB+) under memory pressure.
@@ -160,6 +163,9 @@ final class VoiceInputManager: ObservableObject {
 
         input.installTap(onBus: 0, bufferSize: 8192, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
+            // Muted: report silence and don't feed the recognizer, but keep the
+            // engine running so the session stays alive (tap again to unmute).
+            if self.muted { Task { @MainActor in self.level = 0 }; return }
             // Raw RMS of float PCM speech is tiny (~0.02–0.08), and `.measurement`
             // mode disables input gain — far below what the orb needs to visibly
             // react or what energy-endpointing can threshold. Boost to a usable
