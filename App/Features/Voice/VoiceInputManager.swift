@@ -1,5 +1,6 @@
 import Foundation
 @preconcurrency import AVFoundation
+import Accelerate
 import Speech
 import SwiftWhisper
 import OpenWebUIKit
@@ -24,6 +25,18 @@ final class VoiceInputManager: ObservableObject {
     /// Live mic loudness (RMS, ~0…1) — drives energy-based endpointing for engines
     /// that have no live transcript (server / Whisper).
     @Published var level: Float = 0
+    /// Live FFT magnitude bands (0…1, log-spaced) — drives the spectrum visualizer.
+    @Published var spectrum: [Float] = Array(repeating: 0, count: VoiceInputManager.bandCount)
+
+    // MARK: - FFT (Accelerate)
+    static let bandCount = 28
+    private static let fftLog2: vDSP_Length = 10                  // 1024-point FFT
+    private static let fftSetup: FFTSetup = vDSP_create_fftsetup(fftLog2, FFTRadix(kFFTRadix2))!
+    private static let hann: [Float] = {
+        var w = [Float](repeating: 0, count: 1 << Int(fftLog2))
+        vDSP_hann_window(&w, vDSP_Length(w.count), Int32(vDSP_HANN_NORM))
+        return w
+    }()
 
     // A FRESH engine is created for every recording — reusing one instance across
     // start/stop is unstable on macOS (the 2nd use hung the audio HAL on the main
@@ -165,14 +178,18 @@ final class VoiceInputManager: ObservableObject {
             guard let self else { return }
             // Muted: report silence and don't feed the recognizer, but keep the
             // engine running so the session stays alive (tap again to unmute).
-            if self.muted { Task { @MainActor in self.level = 0 }; return }
+            if self.muted {
+                Task { @MainActor in self.level = 0; self.spectrum = Array(repeating: 0, count: Self.bandCount) }
+                return
+            }
             // Raw RMS of float PCM speech is tiny (~0.02–0.08), and `.measurement`
             // mode disables input gain — far below what the orb needs to visibly
             // react or what energy-endpointing can threshold. Boost to a usable
             // 0…1 range (perceptual: emphasise the quiet end so a normal voice
             // clearly registers).
             let lvl = min(1, Self.rms(buffer).squareRoot() * 1.6)
-            Task { @MainActor in self.level = lvl }
+            let bands = Self.computeSpectrum(buffer)
+            Task { @MainActor in self.level = lvl; if !bands.isEmpty { self.spectrum = bands } }
             if self.captureToModel { self.captureRaw(buffer) }
             else { self.request?.append(buffer) }
         }
@@ -395,6 +412,46 @@ final class VoiceInputManager: ObservableObject {
         var sum: Float = 0
         for i in 0..<n { let s = ch[i]; sum += s * s }
         return (sum / Float(n)).squareRoot()
+    }
+
+    /// Windowed FFT → `bandCount` log-spaced magnitude bands in 0…1, dB-scaled with
+    /// a high-sensitivity floor so a normal voice fills the bars. Runs on the audio
+    /// thread (nonisolated, pure aside from the immutable static FFT setup).
+    nonisolated static func computeSpectrum(_ buffer: AVAudioPCMBuffer) -> [Float] {
+        let n = 1 << Int(fftLog2)
+        guard let ch = buffer.floatChannelData?[0], Int(buffer.frameLength) >= n else { return [] }
+        var windowed = [Float](repeating: 0, count: n)
+        vDSP_vmul(ch, 1, hann, 1, &windowed, 1, vDSP_Length(n))
+
+        let half = n / 2
+        var real = [Float](repeating: 0, count: half)
+        var imag = [Float](repeating: 0, count: half)
+        var mags = [Float](repeating: 0, count: half)
+        windowed.withUnsafeBufferPointer { wp in
+            wp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: half) { cp in
+                real.withUnsafeMutableBufferPointer { rp in
+                    imag.withUnsafeMutableBufferPointer { ip in
+                        var split = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+                        vDSP_ctoz(cp, 2, &split, 1, vDSP_Length(half))
+                        vDSP_fft_zrip(fftSetup, &split, 1, fftLog2, FFTDirection(FFT_FORWARD))
+                        vDSP_zvmags(&split, 1, &mags, 1, vDSP_Length(half))
+                    }
+                }
+            }
+        }
+
+        // Log-spaced bands over bins [1, half); dB-scale each with a generous floor.
+        var out = [Float](repeating: 0, count: bandCount)
+        let minBin = 1.0, maxBin = Double(half)
+        for b in 0..<bandCount {
+            let lo = Int(minBin * pow(maxBin / minBin, Double(b) / Double(bandCount)))
+            let hi = max(lo + 1, Int(minBin * pow(maxBin / minBin, Double(b + 1) / Double(bandCount))))
+            var peak: Float = 0
+            for i in lo..<min(hi, half) { peak = max(peak, mags[i]) }
+            let db = 10 * log10f(peak + 1e-9)          // power → dB
+            out[b] = min(1, max(0, (db + 80) / 80))    // -80 dB floor → high sensitivity
+        }
+        return out
     }
 
     /// Copies raw mono samples (hardware rate) — fast + safe inside the tap.

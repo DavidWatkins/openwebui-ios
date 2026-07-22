@@ -25,6 +25,8 @@ final class VoiceConversation: ObservableObject {
     @Published var model: String?
     /// Live mic loudness (0…1) while listening — drives the orb's reaction.
     @Published private(set) var level: Float = 0
+    /// Live FFT spectrum (0…1 bands) — drives the bottom visualizer.
+    @Published private(set) var spectrum: [Float] = []
     /// Per-conversation server TTS voice ("" = global default). Persisted per chat.
     @Published var ttsVoice: String = ""
 
@@ -74,8 +76,10 @@ final class VoiceConversation: ObservableObject {
         self.client = client
         self.completions = completions
         self.models = models
-        // Honor the user's preferred default model (falls back to the first).
-        self.model = defaultModel ?? models.first?.id
+        // Voice needs tools (weather / web search), so prefer the fast Agent model;
+        // fall back to the user's default. The picker still overrides per session.
+        self.model = models.first { $0.id.hasSuffix(".agent") || $0.name == "Agent (tools)" }?.id
+            ?? defaultModel ?? models.first?.id
         voice.client = client   // enables the "server" STT engine
         // The live conversation forces on-device recognition: it's the only engine
         // that streams partial transcripts (so you see your words as you speak) and
@@ -88,6 +92,13 @@ final class VoiceConversation: ObservableObject {
         voice.$level
             .receive(on: RunLoop.main)
             .sink { [weak self] lvl in self?.levelChanged(lvl) }
+            .store(in: &cancellables)
+        voice.$spectrum
+            .receive(on: RunLoop.main)
+            .sink { [weak self] s in
+                guard let self else { return }
+                self.spectrum = (self.phase == .listening) ? s : []
+            }
             .store(in: &cancellables)
         voice.$error
             .receive(on: RunLoop.main)
@@ -285,7 +296,7 @@ final class VoiceConversation: ObservableObject {
                     case .textDelta(let d):
                         self.reply += d
                         if let i = self.turns.lastIndex(where: { $0.id == replyTurn.id }) {
-                            self.turns[i].text = self.reply
+                            self.turns[i].text = Self.cleanReply(self.reply)
                         }
                     case .error(let m): self.error = m
                     default: break
@@ -353,8 +364,19 @@ final class VoiceConversation: ObservableObject {
 
     // MARK: - Speak (TTS)
 
+    /// Clean a reply for speaking + display: drop the Agent's appended Sources
+    /// block and markdown syntax, and trim the leading blank lines (the "space
+    /// above the text") that thinking-off replies start with.
+    static func cleanReply(_ raw: String) -> String {
+        var s = raw
+        if let r = s.range(of: "\n\n---", options: .backwards) { s = String(s[..<r.lowerBound]) }
+        s = s.replacingOccurrences(of: #"\[([^\]]+)\]\([^)]+\)"#, with: "$1", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"[*_`#>]"#, with: "", options: .regularExpression)
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func speak() {
-        let t = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = Self.cleanReply(reply)
         guard active, !t.isEmpty else { afterSpeaking(); return }
         phase = .speaking
         tts.voiceOverride = ttsVoice.isEmpty ? nil : ttsVoice

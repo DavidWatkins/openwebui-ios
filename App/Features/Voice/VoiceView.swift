@@ -23,7 +23,6 @@ struct VoiceView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var convo: VoiceConversation
     @ObservedObject private var speech = SpeechManager.shared
-    @State private var breathe = false
 
     init(app: AppState, seed: VoiceSeed? = nil, onCommit: (([OWMessage]) -> Void)? = nil) {
         self.app = app
@@ -41,14 +40,8 @@ struct VoiceView: View {
                 theme.bg.ignoresSafeArea()
                 if theme.backdrop { ThemeBackdrop(theme: theme) }
                 VStack(spacing: 0) {
-                    // Cap the transcript so the visualizer sits centered in the
-                    // screen rather than being shoved to the bottom.
-                    transcript.frame(maxHeight: 200)
-                    Spacer(minLength: 0)
-                    orb
-                    statusLine.padding(.top, 6)
-                    Spacer(minLength: 0)
-                    controlButton
+                    transcript                 // fills — live text stays visible
+                    bottomDock                 // spectrum + state + controls
                 }
                 .padding(16)
             }
@@ -132,44 +125,20 @@ struct VoiceView: View {
         }
     }
 
-    // MARK: - Orb
+    // MARK: - Bottom dock (status + spectrum + controls)
 
-    /// ChatGPT-style soft white blob (no icon). It breathes slowly, swells with
-    /// your voice while listening, glows brighter while speaking, and shows a
-    /// spinner while thinking. An accent aura keeps it visible on light themes.
-    private var orb: some View {
-        let amp = convo.phase == .listening ? CGFloat(min(max(convo.level, 0), 1)) : 0
-        let active = convo.phase == .listening || convo.phase == .speaking
-        return ZStack {
-            // Soft accent aura.
-            Circle()
-                .fill(RadialGradient(colors: [theme.accent.opacity(0.32), .clear],
-                                     center: .center, startRadius: 20, endRadius: 170))
-                .frame(width: 320, height: 320)
-                .scaleEffect(breathe ? 1.05 : 0.92)
-            // Circular audio visualizer — bars radiate from a ring and react to
-            // your voice (and gently idle-pulse while speaking).
-            CircularVisualizer(level: amp, active: active, color: .white)
-                .frame(width: 280, height: 280)
-            // Glowing white core.
-            Circle()
-                .fill(RadialGradient(colors: [.white, .white.opacity(0.75), .white.opacity(0.12)],
-                                     center: .init(x: 0.42, y: 0.40), startRadius: 4, endRadius: 90))
-                .frame(width: 128, height: 128)
-                .blur(radius: 4)
-                .shadow(color: .white.opacity(active ? 0.6 : 0.28), radius: active ? 30 : 16)
-                .scaleEffect(0.9 + amp * 0.3 + (breathe ? 0.04 : 0))
-            if convo.phase == .thinking {
-                ProgressView().tint(theme.accent).controlSize(.large)
-            }
+    /// The whole voice affordance lives at the bottom: a status line, a theme-color
+    /// FFT spectrum that reacts while listening (and shimmers while responding), and
+    /// the mute / exit controls. The transcript owns the rest of the screen.
+    private var bottomDock: some View {
+        VStack(spacing: 12) {
+            statusLine
+            SpectrumVisualizer(bands: convo.spectrum, phase: convo.phase, color: theme.accent)
+                .frame(height: 56)
+                .onTapGesture { convo.tapOrb() }
+            controlButton
         }
-        .frame(height: 320)
-        .contentShape(Circle())
-        .onTapGesture { convo.tapOrb() }
-        .animation(.easeOut(duration: 0.12), value: amp)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 2.4).repeatForever(autoreverses: true)) { breathe = true }
-        }
+        .padding(.top, 8)
     }
 
     private var statusLine: some View {
@@ -237,41 +206,44 @@ struct VoiceView: View {
     }
 }
 
-/// A circular audio visualizer: bars radiate from a center ring, their length
-/// driven by the live mic level, with a traveling shimmer so it stays lively even
-/// at low input — the "circular equalizer" look. Redraws every frame via
-/// TimelineView while the voice screen is on.
-struct CircularVisualizer: View {
-    var level: CGFloat            // 0…1 live loudness
-    var active: Bool
-    var color: Color = .white
-    private let bars = 64
+/// A horizontal FFT spectrum bar (center-mirrored) in the theme color. While
+/// LISTENING it renders the live FFT bands; while THINKING/SPEAKING it shows an
+/// animated shimmer to signal activity (the mic is idle then); otherwise a faint
+/// baseline. Redraws every frame via TimelineView.
+struct SpectrumVisualizer: View {
+    var bands: [Float]
+    var phase: VoiceConversation.Phase
+    var color: Color
 
     var body: some View {
         TimelineView(.animation) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             Canvas { ctx, size in
-                let c = CGPoint(x: size.width / 2, y: size.height / 2)
-                let ringR = min(size.width, size.height) * 0.30
-                let maxBar = min(size.width, size.height) * 0.17
-                for i in 0..<bars {
-                    let frac = Double(i) / Double(bars)
-                    let angle = frac * 2 * .pi - .pi / 2
-                    // Two traveling waves → a lively circular-equalizer shimmer.
-                    let shimmer = (sin(t * 3 + frac * .pi * 8) + sin(t * 2 + frac * .pi * 14)) / 2  // -1…1
-                    let norm = (shimmer + 1) / 2                                                    // 0…1
-                    let idle = active ? 0.14 : 0.06
-                    let react = Double(level) * (0.45 + 0.55 * norm)
-                    let h = maxBar * (idle + react)
-                    let inner = CGPoint(x: c.x + cos(angle) * ringR, y: c.y + sin(angle) * ringR)
-                    let outer = CGPoint(x: c.x + cos(angle) * (ringR + h), y: c.y + sin(angle) * (ringR + h))
-                    var p = Path(); p.move(to: inner); p.addLine(to: outer)
-                    ctx.stroke(p, with: .color(color.opacity(0.35 + 0.45 * norm)),
-                               style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                let n = 28
+                let slot = size.width / CGFloat(n)
+                let barW = slot * 0.6
+                let midY = size.height / 2
+                for i in 0..<n {
+                    let frac = Double(i) / Double(n)
+                    var h: CGFloat
+                    switch phase {
+                    case .listening:
+                        h = CGFloat(i < bands.count ? bands[i] : 0)
+                    case .speaking, .thinking:
+                        // No mic input while responding → animated shimmer instead.
+                        let s = (sin(t * 4 + frac * 9) + sin(t * 2.7 + frac * 15)) / 2   // -1…1
+                        h = 0.16 + 0.34 * CGFloat((s + 1) / 2)
+                    default:
+                        h = 0.03
+                    }
+                    let barH = max(3, h * size.height)
+                    let x = CGFloat(i) * slot + (slot - barW) / 2
+                    let rect = CGRect(x: x, y: midY - barH / 2, width: barW, height: barH)
+                    // Center bars a touch brighter for a nice equalizer falloff.
+                    let bright = 0.55 + 0.45 * (1 - abs(frac - 0.5) * 2)
+                    ctx.fill(Path(roundedRect: rect, cornerRadius: barW / 2),
+                             with: .color(color.opacity(0.35 + 0.5 * bright)))
                 }
-                let ring = Path(ellipseIn: CGRect(x: c.x - ringR, y: c.y - ringR,
-                                                  width: ringR * 2, height: ringR * 2))
-                ctx.stroke(ring, with: .color(color.opacity(0.15)), lineWidth: 1)
             }
         }
     }
