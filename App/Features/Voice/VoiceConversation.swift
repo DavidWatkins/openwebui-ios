@@ -56,10 +56,9 @@ final class VoiceConversation: ObservableObject {
     // Matched to VoiceInputManager's boosted 0…1 level: a normal voice reads
     // ~0.35–0.6, room noise ~0.05–0.15, so this cleanly separates speech.
     private let speechLevel: Float = 0.22
-    private var sttIsNative: Bool {
-        let e = UserDefaults.standard.string(forKey: "voice.stt.engine")
-        return e != "model" && e != "server"
-    }
+    // The conversation forces the native engine (see init), so endpointing always
+    // uses the live-transcript path: end the turn on a pause after real words.
+    private let sttIsNative = true
     private var streamTask: Task<Void, Never>?
     private var speakingTurnID = ""
 
@@ -78,6 +77,10 @@ final class VoiceConversation: ObservableObject {
         // Honor the user's preferred default model (falls back to the first).
         self.model = defaultModel ?? models.first?.id
         voice.client = client   // enables the "server" STT engine
+        // The live conversation forces on-device recognition: it's the only engine
+        // that streams partial transcripts (so you see your words as you speak) and
+        // that we can auto-endpoint on a pause without a manual tap.
+        voice.engineOverride = "native"
         voice.$partialText
             .receive(on: RunLoop.main)
             .sink { [weak self] t in self?.partialChanged(t) }

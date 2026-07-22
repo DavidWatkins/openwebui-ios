@@ -32,6 +32,18 @@ struct MessageBubble: View {
 
     /// The model is thinking when reasoning is arriving but no reply text has yet.
     private var isThinking: Bool { isStreaming && message.content.isEmpty }
+
+    /// Whether to draw the text bubble. Suppress an EMPTY bubble when the reply
+    /// is only reasoning (no answer yet, not streaming) — that empty box was the
+    /// "artifact" under the thinking disclosure. Still show the typing bubble while
+    /// streaming, and a placeholder for a truly-empty message with nothing else.
+    private var showBubble: Bool {
+        if !message.content.isEmpty { return true }
+        if isStreaming { return true }
+        // content empty & settled: only a bare message (no reasoning/images/docs)
+        // gets a placeholder; a reasoning-only reply shows just the disclosure.
+        return message.reasoning == nil && message.imageURLs.isEmpty && message.documents.isEmpty
+    }
     private var reasoningExpanded: Bool { reasoningOverride ?? isThinking }
 
     var body: some View {
@@ -44,7 +56,7 @@ struct MessageBubble: View {
                 if !message.documents.isEmpty { documentsView }
                 if editing {
                     editor
-                } else if !message.content.isEmpty || (message.imageURLs.isEmpty && message.documents.isEmpty) {
+                } else if showBubble {
                     bubble.contextMenu { messageMenu }
                 }
                 if !editing, !isStreaming { actionBar }

@@ -2,7 +2,7 @@
 title: Agent
 author: openwebui-ios
 description: Server-side agentic tool loop via prompt-based tool calling. One model call decides + answers; if it emits a tool JSON the pipe runs the tool (SearXNG web search, Open-Meteo weather) and loops. Appends deduplicated citations. Exposes itself as a model so the plain /api/chat/completions API gets contextual tools with no socket.io. Auto-detects the loaded model to survive the router swap cooldown. NB: Open WebUI buffers pipe output over the REST API (no token streaming); a no-tool turn costs ~one base-model call, a tool turn ~two.
-version: 0.10.0
+version: 0.10.1
 required_open_webui_version: 0.6.0
 """
 import json
@@ -268,11 +268,15 @@ class Pipe:
             conv.append({"role": "user", "content": f"Tool result:\n{result}\n\n{note} Do not output JSON."})
         await emit("done", done=True)
 
+        # Empty answer — the thinking model sometimes spends its whole token
+        # budget reasoning (especially after a tool result) and never writes the
+        # reply. Retry with thinking OFF so it reliably produces an answer from the
+        # tool results already in `conv` (keeps whatever reasoning we captured).
         if not (content or "").strip():
-            content, reasoning = await self._model(__request__, user, [m for m in conv if m.get("role") != "system"], think=turn_think)
+            content, _ = await self._model(
+                __request__, user,
+                [m for m in conv if m.get("role") != "system"], think=False)
             content = content or "…"
-            if reasoning:
-                reasonings.append(reasoning)
 
         # Hard fallback: if we fetched valid weather but the model still hedged
         # (no temperature in the reply, or a "can't/couldn't/unable" disclaimer),

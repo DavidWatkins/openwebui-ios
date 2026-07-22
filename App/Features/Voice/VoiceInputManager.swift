@@ -29,7 +29,11 @@ final class VoiceInputManager: ObservableObject {
     // start/stop is unstable on macOS (the 2nd use hung the audio HAL on the main
     // thread and then crashed). A new engine means a clean input node + tap.
     private var engine = AVAudioEngine()
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "pt-BR"))
+    /// Recognizer for the app's current language (was hardcoded to pt-BR, which
+    /// transcribed everything else as garbage). Falls back to the device default.
+    private var recognizer: SFSpeechRecognizer? {
+        SFSpeechRecognizer(locale: LanguageManager.shared.locale) ?? SFSpeechRecognizer()
+    }
 
     private static let targetRate: Double = 16_000
     private static let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
@@ -49,8 +53,14 @@ final class VoiceInputManager: ObservableObject {
     private var cachedWhisper: Whisper?
     private var cachedModelID = ""
 
-    private var useModel: Bool { UserDefaults.standard.string(forKey: "voice.stt.engine") == "model" }
-    private var useServer: Bool { UserDefaults.standard.string(forKey: "voice.stt.engine") == "server" }
+    /// Forces a specific STT engine for this instance, overriding the Settings
+    /// choice. The live voice conversation sets this to "native" because only the
+    /// on-device recognizer streams partial transcripts (live text) and supports
+    /// hands-free silence endpointing; server/Whisper are record-then-transcribe.
+    var engineOverride: String?
+    private var sttEngine: String { engineOverride ?? UserDefaults.standard.string(forKey: "voice.stt.engine") ?? "native" }
+    private var useModel: Bool { sttEngine == "model" }
+    private var useServer: Bool { sttEngine == "server" }
     private var activeModelID: String { UserDefaults.standard.string(forKey: "voice.stt.model") ?? "" }
 
     /// Injected at startup — required for the "server" STT engine.
