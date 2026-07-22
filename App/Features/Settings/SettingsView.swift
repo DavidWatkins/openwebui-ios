@@ -351,7 +351,7 @@ struct MemoryListView: View {
                 .listRowBackground(theme.panel)
             }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(theme.bg)
         .navigationTitle("Memória")
