@@ -263,23 +263,25 @@ final class LocationProvider: NSObject, ObservableObject, CLLocationManagerDeleg
 
 // MARK: - App Intents (Action Button / Siri / Shortcuts)
 
-enum LaunchAction: Equatable { case voice, newChat, camera }
+enum LaunchAction: Equatable { case voice, newChat, camera, share }
 
-/// Shared launch signal between an App Intent (runs in-process when the intent
-/// fires) and the UI. The root view / main list observe `action` and route once
-/// signed in; a request that arrives during cold launch is honored as soon as the
-/// main screen appears.
+/// Shared launch signal between an App Intent / the Share Extension and the UI.
+/// The root view / main list observe `action` and route once signed in; a request
+/// that arrives during cold launch is honored as soon as the main screen appears.
 @MainActor
 final class AppLaunch: ObservableObject {
     static let shared = AppLaunch()
     @Published var action: LaunchAction?
     /// Set alongside `.camera` so the freshly-opened chat pops the camera on appear.
     @Published var openCameraOnNewChat = false
+    /// Content shared in from another app (Share Extension) — applied to a new chat.
+    @Published var pendingShare: SharedItem?
 
     func request(_ a: LaunchAction) {
         action = a
         if a == .camera { openCameraOnNewChat = true }
     }
+    func requestShare(_ item: SharedItem) { pendingShare = item; action = .share }
     func consume() { action = nil }
 }
 

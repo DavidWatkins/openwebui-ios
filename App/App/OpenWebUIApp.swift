@@ -55,6 +55,7 @@ struct RootView: View {
     @EnvironmentObject private var app: AppState
     @EnvironmentObject private var themes: ThemeStore
     @Environment(\.theme) private var theme
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var launch = AppLaunch.shared
     @State private var showVoice = false
 
@@ -91,6 +92,14 @@ struct RootView: View {
         .fullScreenCover(isPresented: $showVoice) { VoiceView(app: app) }
         .onChange(of: launch.action) { _, _ in maybePresentVoice() }
         .onChange(of: app.phase) { _, _ in maybePresentVoice() }
+        // Share Extension → the app opens via openwebui://share; also poll the
+        // App Group inbox on activation in case the URL open didn't reach us.
+        .onOpenURL { url in
+            if url.scheme == "openwebui", url.host == "share" { consumePendingShare() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { consumePendingShare() }
+        }
         #endif
     }
 
@@ -98,6 +107,11 @@ struct RootView: View {
         guard launch.action == .voice, app.phase == .main else { return }
         showVoice = true
         launch.consume()
+    }
+
+    private func consumePendingShare() {
+        guard let item = SharedInbox.take() else { return }
+        launch.requestShare(item)
     }
 }
 

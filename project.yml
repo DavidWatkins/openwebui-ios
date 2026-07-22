@@ -41,16 +41,19 @@ targets:
         excludes:
           - "Resources/Info-macOS.plist"
           - "Resources/OpenWebUI-macOS.entitlements"
+          - "Resources/OpenWebUI.entitlements"
     dependencies:
       - package: OpenWebUIKit
       - package: MarkdownUI
       - package: SwiftWhisper
       - package: ZIPFoundation
       - package: FluidAudio
+      - target: ShareExtension       # embed the Share Extension
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.openwebui
         PRODUCT_NAME: OpenWebUI
+        CODE_SIGN_ENTITLEMENTS: App/Resources/OpenWebUI.entitlements   # App Group
         # 1.3 (7) went live on the App Store 2026-07 — that train is closed.
         MARKETING_VERSION: "1.4"
         CURRENT_PROJECT_VERSION: "9"
@@ -72,6 +75,11 @@ targets:
         # CFBundleVersion=1, which overrode CURRENT_PROJECT_VERSION → "1.0 (1)").
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # Custom URL scheme — the Share Extension opens the app via openwebui://share.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.example.openwebui.share
+            CFBundleURLSchemes:
+              - openwebui
         # Orientations must live in the Info.plist itself — the INFOPLIST_KEY_*
         # build settings are ignored when a custom Info.plist is used, which made
         # the upload fail (90474). iPad needs all four for multitasking.
@@ -138,6 +146,7 @@ targets:
         excludes:
           - "Resources/Info.plist"
           - "Resources/OpenWebUI-macOS.entitlements"
+          - "Resources/OpenWebUI.entitlements"   # iOS-only App Group entitlement
     dependencies:
       - package: OpenWebUIKit
       - package: MarkdownUI
@@ -171,3 +180,20 @@ targets:
         NSLocalNetworkUsageDescription: "O app precisa acessar o servidor Open WebUI na sua rede local."
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+
+  # Share Extension — share a URL / text / PDF from any app into a new chat.
+  ShareExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ShareExtension
+      - path: App/Shared/SharedInbox.swift   # shared with the app target
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.openwebui.ShareExtension
+        PRODUCT_NAME: ShareExtension
+        MARKETING_VERSION: "1.4"
+        CURRENT_PROJECT_VERSION: "9"
+        INFOPLIST_FILE: ShareExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: ShareExtension/ShareExtension.entitlements
+        SKIP_INSTALL: YES

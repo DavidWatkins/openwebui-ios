@@ -200,6 +200,23 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// Apply content shared in from another app (Share Extension): a URL fetches
+    /// the page for RAG, text prefills the composer, a file is uploaded + attached.
+    func applyShared(_ item: SharedItem) async {
+        switch item.kind {
+        case .url:
+            if let t = item.text, !t.isEmpty { await attachWebPage(t) }
+        case .text:
+            if let t = item.text, !t.isEmpty { input = t }
+        case .file:
+            if let name = item.fileName, let data = SharedInbox.readFile(name) {
+                await addDocument(data: data, filename: item.displayName ?? name,
+                                  mime: item.mime ?? "application/octet-stream")
+                SharedInbox.removeFile(name)
+            }
+        }
+    }
+
     /// Process a web page server-side and attach its content (RAG).
     func attachWebPage(_ urlString: String) async {
         let url = urlString.trimmingCharacters(in: .whitespacesAndNewlines)

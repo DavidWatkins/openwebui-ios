@@ -84,6 +84,11 @@ struct ChatScreen: View {
                 AppLaunch.shared.openCameraOnNewChat = false
                 showCamera = true
             }
+            // Share Extension → apply the shared URL / text / file to this new chat.
+            if vm.chatID == nil, let item = AppLaunch.shared.pendingShare {
+                AppLaunch.shared.pendingShare = nil
+                Task { await vm.applyShared(item) }
+            }
         }
         // Coming back from the background: re-fetch so messages/images created
         // meanwhile on the web UI show up (unless we're mid-stream).

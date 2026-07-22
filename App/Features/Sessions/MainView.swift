@@ -239,9 +239,9 @@ struct ChatListView: View {
     /// New-chat / camera App Intents open a fresh chat here. (Voice is handled by
     /// RootView.) The camera intent leaves `openCameraOnNewChat` set for ChatScreen.
     private func routeLaunch() {
-        guard let a = launch.action, a == .newChat || a == .camera else { return }
+        guard let a = launch.action, a == .newChat || a == .camera || a == .share else { return }
         path.append(.new(mode: app.preferredChatMode))
-        launch.consume()
+        launch.consume()   // openCameraOnNewChat / pendingShare stay for ChatScreen
     }
 
     private var emptyState: some View {
