@@ -261,46 +261,72 @@ final class LocationProvider: NSObject, ObservableObject, CLLocationManagerDeleg
     nonisolated func locationManager(_ m: CLLocationManager, didFailWithError error: Error) {}
 }
 
-// MARK: - Action Button / Siri: start a voice conversation
+// MARK: - App Intents (Action Button / Siri / Shortcuts)
 
-/// Shared launch signal between the App Intent (runs in-process when the intent
-/// fires) and the UI. The root view observes `requested` and presents the voice
-/// screen once the app is signed in; a request that arrives during cold launch is
-/// honored as soon as the main screen appears.
+enum LaunchAction: Equatable { case voice, newChat, camera }
+
+/// Shared launch signal between an App Intent (runs in-process when the intent
+/// fires) and the UI. The root view / main list observe `action` and route once
+/// signed in; a request that arrives during cold launch is honored as soon as the
+/// main screen appears.
 @MainActor
-final class VoiceLaunch: ObservableObject {
-    static let shared = VoiceLaunch()
-    @Published var requested = false
-    func request() { requested = true }
-    func consume() { requested = false }
+final class AppLaunch: ObservableObject {
+    static let shared = AppLaunch()
+    @Published var action: LaunchAction?
+    /// Set alongside `.camera` so the freshly-opened chat pops the camera on appear.
+    @Published var openCameraOnNewChat = false
+
+    func request(_ a: LaunchAction) {
+        action = a
+        if a == .camera { openCameraOnNewChat = true }
+    }
+    func consume() { action = nil }
 }
 
-/// Assignable to the Action Button (Settings › Action Button › Shortcut) and to
-/// Siri: opens the app straight into a hands-free voice conversation.
+/// Opens the app straight into a hands-free voice conversation.
 struct StartVoiceConversationIntent: AppIntent {
     static var title: LocalizedStringResource = "Start Voice Conversation"
     static var description = IntentDescription("Open OpenWebUI and start a hands-free voice conversation.")
     static var openAppWhenRun = true
+    @MainActor func perform() async throws -> some IntentResult {
+        AppLaunch.shared.request(.voice); return .result()
+    }
+}
 
-    @MainActor
-    func perform() async throws -> some IntentResult {
-        VoiceLaunch.shared.request()
-        return .result()
+/// Opens the app to a fresh chat, ready to type.
+struct StartNewChatIntent: AppIntent {
+    static var title: LocalizedStringResource = "New Chat"
+    static var description = IntentDescription("Open OpenWebUI to a new chat.")
+    static var openAppWhenRun = true
+    @MainActor func perform() async throws -> some IntentResult {
+        AppLaunch.shared.request(.newChat); return .result()
+    }
+}
+
+/// Opens the app to a new chat and pops the camera — snap a photo and ask about it.
+struct AskAboutPhotoIntent: AppIntent {
+    static var title: LocalizedStringResource = "Take a Photo to Ask"
+    static var description = IntentDescription("Open OpenWebUI, take a photo, and ask about it in a new chat.")
+    static var openAppWhenRun = true
+    @MainActor func perform() async throws -> some IntentResult {
+        AppLaunch.shared.request(.camera); return .result()
     }
 }
 
 struct OpenWebUIShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
-        AppShortcut(
-            intent: StartVoiceConversationIntent(),
-            phrases: [
-                "Start a voice conversation in \(.applicationName)",
-                "Talk to \(.applicationName)",
-                "Open voice in \(.applicationName)",
-            ],
-            shortTitle: "Voice",
-            systemImageName: "waveform"
-        )
+        AppShortcut(intent: StartVoiceConversationIntent(),
+                    phrases: ["Start a voice conversation in \(.applicationName)",
+                              "Talk to \(.applicationName)", "Open voice in \(.applicationName)"],
+                    shortTitle: "Voice", systemImageName: "waveform")
+        AppShortcut(intent: StartNewChatIntent(),
+                    phrases: ["New chat in \(.applicationName)",
+                              "Start a new chat in \(.applicationName)"],
+                    shortTitle: "New Chat", systemImageName: "square.and.pencil")
+        AppShortcut(intent: AskAboutPhotoIntent(),
+                    phrases: ["Take a photo to ask \(.applicationName)",
+                              "Ask \(.applicationName) about a photo"],
+                    shortTitle: "Photo", systemImageName: "camera")
     }
 }
 

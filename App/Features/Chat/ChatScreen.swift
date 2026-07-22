@@ -79,6 +79,11 @@ struct ChatScreen: View {
         .onAppear {
             vm.loadHistoryIfNeeded()
             voice.client = app.client
+            // "Take a Photo to Ask" App Intent → pop the camera on a fresh chat.
+            if vm.chatID == nil, AppLaunch.shared.openCameraOnNewChat {
+                AppLaunch.shared.openCameraOnNewChat = false
+                showCamera = true
+            }
         }
         // Coming back from the background: re-fetch so messages/images created
         // meanwhile on the web UI show up (unless we're mid-stream).

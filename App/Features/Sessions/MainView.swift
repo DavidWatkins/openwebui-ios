@@ -19,6 +19,7 @@ struct ChatListView: View {
     @Environment(\.theme) private var theme
     @StateObject private var store: ChatStore
     @State private var path: [ChatRoute] = []
+    @ObservedObject private var launch = AppLaunch.shared
     @State private var showSettings = false
     @State private var showNotes = false
     @State private var showWorkspace = false
@@ -101,6 +102,9 @@ struct ChatListView: View {
             }
         }
         .tint(theme.accent)
+        // New-chat / camera App Intents (Action Button, Siri, Shortcuts) route here.
+        .onChange(of: launch.action) { _, _ in routeLaunch() }
+        .onAppear { routeLaunch() }
         .sheet(isPresented: $showSettings) {
             SettingsView().environmentObject(app).environmentObject(themes)
         }
@@ -230,6 +234,14 @@ struct ChatListView: View {
     private func startRename(_ chat: OWChatSummary) {
         renameText = chat.title
         renaming = chat
+    }
+
+    /// New-chat / camera App Intents open a fresh chat here. (Voice is handled by
+    /// RootView.) The camera intent leaves `openCameraOnNewChat` set for ChatScreen.
+    private func routeLaunch() {
+        guard let a = launch.action, a == .newChat || a == .camera else { return }
+        path.append(.new(mode: app.preferredChatMode))
+        launch.consume()
     }
 
     private var emptyState: some View {
