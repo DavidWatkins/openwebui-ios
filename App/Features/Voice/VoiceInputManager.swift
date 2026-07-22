@@ -176,7 +176,9 @@ final class VoiceInputManager: ObservableObject {
             }
         }
 
-        input.installTap(onBus: 0, bufferSize: 8192, format: inputFormat) { [weak self] buffer, _ in
+        // Smaller buffer → the level/FFT update ~4× more often (smoother visualizer,
+        // snappier endpointing). Still ≥ the 1024-sample FFT window.
+        input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
             // Muted: report silence and don't feed the recognizer, but keep the
             // engine running so the session stays alive (tap again to unmute).

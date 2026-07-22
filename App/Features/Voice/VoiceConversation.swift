@@ -23,10 +23,13 @@ final class VoiceConversation: ObservableObject {
     @Published var reply = ""           // streaming assistant reply
     @Published var error: String?
     @Published var model: String?
-    /// Live mic loudness (0…1) while listening — drives the orb's reaction.
-    @Published private(set) var level: Float = 0
-    /// Live FFT spectrum (0…1 bands) — drives the bottom visualizer.
-    @Published private(set) var spectrum: [Float] = []
+    /// Live mic loudness (0…1) — used internally for energy endpointing. NOT
+    /// @Published: it changes many times/sec and the view doesn't read it, so
+    /// publishing it just churned re-renders.
+    private var level: Float = 0
+    /// Live FFT bands for the visualizer — a plain reference the Canvas reads each
+    /// frame (see SpectrumSource) so the fast audio updates don't re-render the view.
+    let spectrumSource = SpectrumSource()
     /// Per-conversation server TTS voice ("" = global default). Persisted per chat.
     @Published var ttsVoice: String = ""
 
@@ -69,6 +72,14 @@ final class VoiceConversation: ObservableObject {
     /// user taps the orb to end the turn).
     private let endpointSilence: TimeInterval = 1.6
 
+    /// Mic-based barge-in (talk over the reply to interrupt). OFF by default: it
+    /// needs a duplex `.voiceChat` session + a second audio engine for echo
+    /// cancellation, which glitched the tail of the spoken reply. You can still
+    /// interrupt by tapping the orb. Opt in via the Settings toggle.
+    private var bargeInEnabled: Bool {
+        UserDefaults.standard.object(forKey: "voice.bargein.enabled") as? Bool ?? false
+    }
+
     private var seeded = false
 
     init(client: OpenWebUIClient, completions: ChatCompletionsClient, models: [OWModel],
@@ -97,7 +108,7 @@ final class VoiceConversation: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] s in
                 guard let self else { return }
-                self.spectrum = (self.phase == .listening) ? s : []
+                self.spectrumSource.set(self.phase == .listening ? s : [])
             }
             .store(in: &cancellables)
         voice.$error
@@ -166,7 +177,9 @@ final class VoiceConversation: ObservableObject {
     func startSession() async {
         guard !active else { return }
         active = true; error = nil; reply = ""
-        tts.duplexSession = true   // play-AND-record so barge-in can listen mid-reply
+        // Duplex (play-AND-record) only when mic barge-in is on; otherwise a clean
+        // `.playback` session so the spoken reply doesn't glitch at the end.
+        tts.duplexSession = bargeInEnabled
         enableProximity()
         await listen()
     }
@@ -382,9 +395,8 @@ final class VoiceConversation: ObservableObject {
         tts.voiceOverride = ttsVoice.isEmpty ? nil : ttsVoice
         tts.onSpeechFinished = { [weak self] in self?.afterSpeaking() }
         tts.toggle(t, id: speakingTurnID)
-        // Listen for the user cutting in (barge-in) while the reply plays.
-        let bargeOn = UserDefaults.standard.object(forKey: "voice.bargein.enabled") as? Bool ?? true
-        if bargeOn { bargeMonitor.start { [weak self] in self?.bargeIn() } }
+        // Listen for the user cutting in (barge-in) while the reply plays — opt-in.
+        if bargeInEnabled { bargeMonitor.start { [weak self] in self?.bargeIn() } }
     }
 
     /// User started talking over the reply → stop speaking and listen.
@@ -400,7 +412,13 @@ final class VoiceConversation: ObservableObject {
         bargeMonitor.stop()
         tts.onSpeechFinished = nil
         guard active else { phase = .idle; return }
-        Task { await listen() }
+        // Let the playback tail drain before switching the session back to record —
+        // an immediate switch clips/repeats the last hardware buffer (the end click).
+        Task {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard self.active, self.phase != .listening else { return }
+            await self.listen()
+        }
     }
 
     /// Follows the app's selected UI language instead of forcing pt-BR — the

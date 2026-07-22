@@ -133,7 +133,7 @@ struct VoiceView: View {
     private var bottomDock: some View {
         VStack(spacing: 12) {
             statusLine
-            SpectrumVisualizer(bands: convo.spectrum, phase: convo.phase, color: theme.accent)
+            SpectrumVisualizer(source: convo.spectrumSource, phase: convo.phase, color: theme.accent)
                 .frame(height: 56)
                 .onTapGesture { convo.tapOrb() }
             controlButton
@@ -206,12 +206,25 @@ struct VoiceView: View {
     }
 }
 
+/// Holds the latest FFT bands and eases them toward the target every frame. It's
+/// a plain reference (not @Published) so the audio spectrum — which arrives only a
+/// few times per second — doesn't re-render the whole voice screen and fight the
+/// 60fps animation (that was the stutter). The Canvas reads it each frame.
+final class SpectrumSource {
+    private var target = [Float](repeating: 0, count: VoiceInputManager.bandCount)
+    private(set) var display = [Float](repeating: 0, count: VoiceInputManager.bandCount)
+    func set(_ b: [Float]) { if b.count == target.count { target = b } }
+    func clear() { for i in target.indices { target[i] = 0 } }
+    /// Ease toward the target; call once per rendered frame.
+    func tick() { for i in display.indices { display[i] += (target[i] - display[i]) * 0.35 } }
+}
+
 /// A horizontal FFT spectrum bar (center-mirrored) in the theme color. While
 /// LISTENING it renders the live FFT bands; while THINKING/SPEAKING it shows an
 /// animated shimmer to signal activity (the mic is idle then); otherwise a faint
 /// baseline. Redraws every frame via TimelineView.
 struct SpectrumVisualizer: View {
-    var bands: [Float]
+    var source: SpectrumSource
     var phase: VoiceConversation.Phase
     var color: Color
 
@@ -219,6 +232,8 @@ struct SpectrumVisualizer: View {
         TimelineView(.animation) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             Canvas { ctx, size in
+                source.tick()                 // ease bars toward the latest FFT
+                let bands = source.display
                 let n = 28
                 let slot = size.width / CGFloat(n)
                 let barW = slot * 0.6
