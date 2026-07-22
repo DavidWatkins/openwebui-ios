@@ -2,7 +2,7 @@
 title: Agent
 author: openwebui-ios
 description: Server-side agentic tool loop via prompt-based tool calling. One model call decides + answers; if it emits a tool JSON the pipe runs the tool (SearXNG web search, Open-Meteo weather) and loops. Appends deduplicated citations. Exposes itself as a model so the plain /api/chat/completions API gets contextual tools with no socket.io. Auto-detects the loaded model to survive the router swap cooldown. NB: Open WebUI buffers pipe output over the REST API (no token streaming); a no-tool turn costs ~one base-model call, a tool turn ~two.
-version: 0.10.3
+version: 0.10.4
 required_open_webui_version: 0.6.0
 """
 import json
@@ -274,7 +274,16 @@ class Pipe:
             }})
 
         base_msgs = list(body.get("messages", []))
-        conv = [{"role": "system", "content": TOOL_DOC}] + base_msgs
+        # A SECOND system message (the app's date/time-location-instructions context,
+        # or a voice persona) suppresses tool use, so fold any incoming system prompts
+        # INTO the tool doc — tool directive first — leaving one system message.
+        extra_system = "\n\n".join(
+            m["content"] for m in base_msgs
+            if m.get("role") == "system" and isinstance(m.get("content"), str) and m["content"].strip()
+        )
+        non_system = [m for m in base_msgs if m.get("role") != "system"]
+        system_content = TOOL_DOC + (("\n\n---\nAdditional context and instructions:\n" + extra_system) if extra_system else "")
+        conv = [{"role": "system", "content": system_content}] + non_system
         sources, content = [], ""
         reasonings = []  # thinking from each answer-generating call, surfaced for auditing
 

@@ -50,6 +50,9 @@ final class VoiceConversation: ObservableObject {
     /// one thread, carry over both ways, and honor the chat's mode (server/local/
     /// temporary). nil = legacy standalone behaviour (self-persist to the server).
     var onCommit: (([OWMessage]) -> Void)?
+    /// Supplies the ambient-context system message (date/time, location, custom
+    /// instructions), evaluated per turn. Set by VoiceView from AppState.
+    var contextProvider: (() -> OWChatMessageInput?)?
 
     private var cancellables = Set<AnyCancellable>()
     private var silenceTimer: Timer?
@@ -295,8 +298,18 @@ final class VoiceConversation: ObservableObject {
         guard let model else { error = L("Nenhum modelo disponível."); phase = .idle; return }
         phase = .thinking
         reply = ""
-        var msgs = [OWChatMessageInput(role: "system", text: Self.systemPrompt)]
-        for t in turns { msgs.append(OWChatMessageInput(role: t.role, text: t.text)) }
+        // Ambient context (date/time, location, custom instructions) — same as the
+        // typed chat; voice was missing it entirely.
+        var msgs: [OWChatMessageInput] = []
+        if let ctx = contextProvider?() { msgs.append(ctx) }
+        // The voice style/brevity hint rides on the LAST user turn (in the copy
+        // sent to the model, not the stored turn). A competing SYSTEM persona
+        // suppressed the Agent's tools — a user-turn hint doesn't.
+        let lastUserIdx = turns.lastIndex(where: { $0.role == "user" })
+        for (i, t) in turns.enumerated() {
+            let text = (i == lastUserIdx) ? "\(t.text)\n\n(\(Self.voiceHint))" : t.text
+            msgs.append(OWChatMessageInput(role: t.role, text: text))
+        }
         let replyTurn = Turn(role: "assistant", text: "")
         turns.append(replyTurn)
         speakingTurnID = replyTurn.id
@@ -424,13 +437,12 @@ final class VoiceConversation: ObservableObject {
     /// Follows the app's selected UI language instead of forcing pt-BR — the
     /// prompt previously hard-coded "falando português do Brasil", so the agent
     /// always replied in Portuguese regardless of the user's language.
-    static var systemPrompt: String {
+    /// Style/brevity/language hint appended to the user's spoken turn (not a system
+    /// prompt — that suppressed the Agent's tools). Phrased as final-answer guidance
+    /// so it never blocks a tool call.
+    static var voiceHint: String {
         let language = LanguageManager.shared.current.endonym   // e.g. "English", "Português"
-        return """
-        You are a friendly voice companion. Reply in \(language) (unless the user \
-        clearly speaks another language, then match theirs). Keep replies short and \
-        natural — 1 to 3 sentences, like spoken conversation. No lists, markdown, or \
-        emoji, just fluid speech.
-        """
+        return "Spoken conversation: use your tools for anything current or factual, "
+            + "then reply in \(language) as 1–2 short natural sentences — no lists, markdown, or emoji."
     }
 }

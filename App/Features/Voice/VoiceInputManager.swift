@@ -32,9 +32,9 @@ final class VoiceInputManager: ObservableObject {
     // Immutable read-only setup shared with the nonisolated audio-thread FFT, so
     // it's marked nonisolated (the class is @MainActor).
     nonisolated static let bandCount = 28
-    nonisolated(unsafe) private static let fftLog2: vDSP_Length = 10       // 1024-point FFT
+    nonisolated private static let fftLog2: vDSP_Length = 10       // 1024-point FFT
     nonisolated(unsafe) private static let fftSetup: FFTSetup = vDSP_create_fftsetup(fftLog2, FFTRadix(kFFTRadix2))!
-    nonisolated(unsafe) private static let hann: [Float] = {
+    nonisolated private static let hann: [Float] = {
         var w = [Float](repeating: 0, count: 1 << Int(fftLog2))
         vDSP_hann_window(&w, vDSP_Length(w.count), Int32(vDSP_HANN_NORM))
         return w
@@ -158,6 +158,7 @@ final class VoiceInputManager: ObservableObject {
             let req = SFSpeechAudioBufferRecognitionRequest()
             req.shouldReportPartialResults = true
             req.requiresOnDeviceRecognition = rec.supportsOnDeviceRecognition
+            req.addsPunctuation = true   // "?" at the end of a spoken question, commas, etc.
             request = req
             task = rec.recognitionTask(with: req) { [weak self] result, err in
                 Task { @MainActor in
