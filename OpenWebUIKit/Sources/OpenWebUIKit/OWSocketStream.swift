@@ -7,6 +7,7 @@ public enum OWSocketUpdate: Sendable {
     case content(String)    // full assistant text so far
     case reasoning(String)  // full thinking text so far (separate disclosure)
     case status(String)     // tool-progress description (e.g. "🔧 weather: Boston")
+    case toolUse(OWToolUse) // a completed, auditable tool run (query + results)
     case done
     case error(String)
 }
@@ -42,9 +43,10 @@ extension OpenWebUIClient {
                             if let t = ev.text, !t.isEmpty { continuation.yield(.content(t)) }
                             if ev.done { continuation.yield(.done); continuation.finish() }
                         case "status":
-                            // Skip the terminal "done" marker — it's an end signal,
-                            // not a tool the user should see running.
-                            if let s = ev.statusText, !ev.done, s != "done" {
+                            if let t = ev.toolUse {
+                                continuation.yield(.toolUse(t))   // completed, auditable run
+                            } else if let s = ev.statusText, !ev.done, s != "done" {
+                                // Transient progress ("🔧 …"); skip the terminal marker.
                                 continuation.yield(.status(s))
                             }
                         case "chat:active":

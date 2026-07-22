@@ -2,7 +2,7 @@
 title: Agent
 author: openwebui-ios
 description: Server-side agentic tool loop via prompt-based tool calling. One model call decides + answers; if it emits a tool JSON the pipe runs the tool (SearXNG web search, Open-Meteo weather) and loops. Appends deduplicated citations. Exposes itself as a model so the plain /api/chat/completions API gets contextual tools with no socket.io. Auto-detects the loaded model to survive the router swap cooldown. NB: Open WebUI buffers pipe output over the REST API (no token streaming); a no-tool turn costs ~one base-model call, a tool turn ~two.
-version: 0.10.2
+version: 0.10.3
 required_open_webui_version: 0.6.0
 """
 import json
@@ -256,6 +256,23 @@ class Pipe:
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": desc, "done": done}})
 
+        async def emit_tool(action, query, results, srcs):
+            # A rich, PERSISTENT status entry (stored in the message's statusHistory)
+            # so the app can render an auditable "what it searched + what it got back"
+            # card. The web UI just shows `description`; the extra fields are ours.
+            if not __event_emitter__:
+                return
+            label = {"web_search": "🔍 Searched the web",
+                     "weather": "🌤️ Checked the weather"}.get(action, f"🔧 {action}")
+            await __event_emitter__({"type": "status", "data": {
+                "description": f"{label}: {query}",
+                "action": action,
+                "query": query,
+                "results": (results or "")[:3000],
+                "sources": [{"title": t, "url": u} for t, u in (srcs or [])],
+                "done": True,
+            }})
+
         base_msgs = list(body.get("messages", []))
         conv = [{"role": "system", "content": TOOL_DOC}] + base_msgs
         sources, content = [], ""
@@ -273,6 +290,7 @@ class Pipe:
             if loc:
                 await emit(f"🔧 weather: {loc}")
                 result, _ = self._weather(loc)
+                await emit_tool("weather", loc, result, [])
                 if not result.startswith("["):
                     weather_result = result
                 conv.append({"role": "assistant", "content": json.dumps({"tool": "weather", "location": loc})})
@@ -291,6 +309,7 @@ class Pipe:
                 break  # `content` is the direct/grounded answer
             await emit(f"🔧 {call.get('tool')}: {call.get('query') or call.get('location') or ''}")
             result, srcs = self._execute(call)
+            await emit_tool(call.get("tool"), call.get("query") or call.get("location") or "", result, srcs)
             sources.extend(srcs)
             failed = result.startswith("[")
             note = ("That returned nothing useful; answer from your own knowledge and note it may be dated."

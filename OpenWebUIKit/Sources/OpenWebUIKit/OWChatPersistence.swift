@@ -26,6 +26,16 @@ struct OWChatPayload: Encodable {
         var parentId: String?
         var childrenIds: [String]
         var files: [OWAttachment]?       // attached images + documents
+        var statusHistory: [OWStatusEntry]?   // auditable tool runs
+    }
+
+    /// Rebuild the statusHistory payload for a node's tool cards (so a rewrite
+    /// doesn't drop them).
+    static func statusHistory(_ toolUses: [OWToolUse]) -> [OWStatusEntry]? {
+        toolUses.isEmpty ? nil : toolUses.map {
+            OWStatusEntry(action: $0.action, query: $0.query, results: $0.results,
+                          sources: $0.sources, description: $0.title, done: true)
+        }
     }
 
     struct History: Encodable {
@@ -60,7 +70,8 @@ struct OWChatPayload: Encodable {
                 files: {
                     let atts = m.imageURLs.map { OWAttachment(type: "image", url: $0) } + m.documents
                     return atts.isEmpty ? nil : atts
-                }()
+                }(),
+                statusHistory: Self.statusHistory(m.toolUses)
             )
             list.append(msg)
             map[m.id] = msg
@@ -106,7 +117,8 @@ struct OWChatPayload: Encodable {
                 modelName: isUser ? nil : (n.model ?? fallbackModel),
                 parentId: n.parentId,
                 childrenIds: (childrenOf[n.id] ?? []).map(\.id),
-                files: atts.isEmpty ? nil : atts
+                files: atts.isEmpty ? nil : atts,
+                statusHistory: Self.statusHistory(n.toolUses)
             )
         }
 

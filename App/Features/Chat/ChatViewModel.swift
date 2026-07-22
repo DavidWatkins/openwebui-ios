@@ -303,6 +303,9 @@ final class ChatViewModel: ObservableObject {
                 setContent(assistant.id, full)   // cumulative → replace, not append
             case .reasoning(let full):
                 setReasoning(assistant.id, full) // cumulative → replace, not append
+            case .toolUse(let t):
+                toolStatus = nil                 // the run finished → drop the spinner
+                addToolUse(assistant.id, t)
             case .status(let s):
                 toolStatus = s
             case .done:
@@ -660,6 +663,11 @@ final class ChatViewModel: ObservableObject {
     /// Cumulative reasoning (socket sends the full thinking each tick → replace).
     private func setReasoning(_ id: String, _ text: String) {
         if let i = index(of: id) { messages[i].reasoning = text }
+    }
+    /// Append a completed tool run (dedup by id) so the auditable card appears live.
+    private func addToolUse(_ id: String, _ t: OWToolUse) {
+        guard let i = index(of: id) else { return }
+        if !messages[i].toolUses.contains(where: { $0.id == t.id }) { messages[i].toolUses.append(t) }
     }
 
     // MARK: - Background completion + local notification

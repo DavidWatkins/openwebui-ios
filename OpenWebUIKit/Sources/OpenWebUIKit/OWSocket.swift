@@ -26,6 +26,8 @@ public actor OWSocket {
         public let reasoning: String?
         /// For `status` — the tool-progress description (e.g. "🔧 weather: Boston").
         public let statusText: String?
+        /// For a rich `status` entry (the Agent's tool run) — the auditable record.
+        public let toolUse: OWToolUse?
         /// True on the final `chat:completion` (`done`) or a `chat:active:false`.
         public let done: Bool
     }
@@ -182,6 +184,7 @@ public actor OWSocket {
         var text: String?
         var reasoning: String?
         var statusText: String?
+        var toolUse: OWToolUse?
         var done = false
         switch type {
         case "chat:completion":
@@ -219,6 +222,14 @@ public actor OWSocket {
             done = (data["done"] as? Bool) ?? false
         case "status":
             statusText = data["description"] as? String
+            // A rich tool-run entry (the Agent adds `action`/`query`/`results`).
+            if let action = data["action"] as? String {
+                let srcs = (data["sources"] as? [[String: Any]] ?? []).map {
+                    OWSource(title: $0["title"] as? String ?? "", url: $0["url"] as? String ?? "")
+                }
+                toolUse = OWToolUse(action: action, query: data["query"] as? String ?? "",
+                                    results: data["results"] as? String ?? "", sources: srcs)
+            }
             done = (data["done"] as? Bool) ?? false
         case "chat:active":
             done = ((data["active"] as? Bool) == false)
@@ -228,7 +239,7 @@ public actor OWSocket {
         onEvent?(Event(chatID: payload["chat_id"] as? String ?? "",
                        messageID: payload["message_id"] as? String ?? "",
                        type: type, text: text, reasoning: reasoning,
-                       statusText: statusText, done: done))
+                       statusText: statusText, toolUse: toolUse, done: done))
     }
 
     // MARK: - Low-level
