@@ -257,6 +257,9 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
         try c.encode(content, forKey: .content)
         try c.encodeIfPresent(model, forKey: .model)
         try c.encodeIfPresent(timestamp, forKey: .timestamp)
+        // Persist the branch link so a cached history tree survives a round-trip
+        // (without this the offline cache would flatten every conversation).
+        try c.encodeIfPresent(parentId, forKey: .parentId)
         // Persist thinking so it survives a history reload. `reasoning_content` is
         // the OpenAI-compatible name the backend pipes through; the decoder above
         // also accepts `reasoning`, so our own round-trip works either way.
@@ -371,6 +374,29 @@ public struct OWChat: Decodable, Sendable, Identifiable {
     public init(id: String, title: String, models: [String] = [], messages: [OWMessage] = []) {
         self.id = id; self.title = title; self.models = models; self.messages = messages
         self.allMessages = messages; self.currentId = messages.last?.id
+    }
+
+    /// Rebuilds a chat from a cached history tree (all nodes + the active leaf) —
+    /// used to restore a server chat for offline reading. Derives the active
+    /// branch (`messages`) by walking `currentId → root`.
+    public init(id: String, title: String, models: [String],
+                allMessages: [OWMessage], currentId: String?) {
+        self.id = id; self.title = title; self.models = models
+        self.allMessages = allMessages; self.currentId = currentId
+        self.messages = OWChat.activeBranch(allMessages, currentId: currentId)
+    }
+
+    /// The active branch (currentId → root, reversed) from a flat node list.
+    static func activeBranch(_ nodes: [OWMessage], currentId: String?) -> [OWMessage] {
+        let map = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        guard let cur = currentId, map[cur] != nil else {
+            return nodes.sorted { ($0.timestamp ?? 0) < ($1.timestamp ?? 0) }
+        }
+        var chain: [OWMessage] = []
+        var id: String? = cur
+        var guardN = 0
+        while let i = id, let m = map[i], guardN < 10_000 { chain.append(m); id = m.parentId; guardN += 1 }
+        return chain.reversed()
     }
 
     public init(from decoder: Decoder) throws {

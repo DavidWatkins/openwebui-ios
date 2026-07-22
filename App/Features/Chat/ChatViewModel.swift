@@ -136,10 +136,19 @@ final class ChatViewModel: ObservableObject {
                 self.loadTree(from: chat)
                 if let m = chat.models.first { self.selectedModel = m }
                 if !chat.title.isEmpty { self.title = chat.title }
+                self.localStore.cacheChat(chat)   // keep the offline copy fresh
                 self.historyLoaded = true
             } catch is CancellationError {
             } catch {
-                self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                // Offline / server error: fall back to the cached copy if we have one.
+                if let cached = self.localStore.cachedChat(id: id) {
+                    self.loadTree(from: cached)
+                    if let m = cached.models.first { self.selectedModel = m }
+                    if !cached.title.isEmpty { self.title = cached.title }
+                    self.historyLoaded = true
+                } else {
+                    self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                }
             }
         }
     }
@@ -443,6 +452,11 @@ final class ChatViewModel: ObservableObject {
             let id = try await client.createChatTree(title: title, models: models,
                                                      tree: Array(tree.values), currentId: currentLeafId)
             chatID = id; self.title = title
+        }
+        // Keep the offline cache in step with what we just wrote.
+        if mode == .server, let id = chatID {
+            localStore.cacheChat(OWChat(id: id, title: chatTitle(), models: models,
+                                        allMessages: Array(tree.values), currentId: currentLeafId))
         }
     }
 

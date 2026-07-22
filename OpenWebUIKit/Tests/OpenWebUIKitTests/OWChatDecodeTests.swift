@@ -84,4 +84,21 @@ final class OWChatDecodeTests: XCTestCase {
         XCTAssertEqual(m.imageURLs, ["data:image/png;base64,xx"])
         XCTAssertEqual(m.documents.first?.id, "f1")
     }
+    /// The offline cache encodes the whole tree with `OWMessage`'s own codec and
+    /// rebuilds it with `OWChat(allMessages:currentId:)`. The branch links
+    /// (`parentId`) must survive the round-trip, or every cached chat flattens.
+    func testCacheRoundTripPreservesBranchTree() throws {
+        var u1 = OWMessage(id: "u1", role: .user, content: "hi", timestamp: 1); u1.parentId = nil
+        var a1 = OWMessage(id: "a1", role: .assistant, content: "A", timestamp: 2); a1.parentId = "u1"
+        var a2 = OWMessage(id: "a2", role: .assistant, content: "B", timestamp: 3); a2.parentId = "u1"
+
+        let data = try JSONEncoder().encode([u1, a1, a2])
+        let decoded = try JSONDecoder().decode([OWMessage].self, from: data)
+        XCTAssertEqual(decoded.first { $0.id == "a2" }?.parentId, "u1")
+
+        let chat = OWChat(id: "c", title: "t", models: ["m"], allMessages: decoded, currentId: "a2")
+        XCTAssertEqual(chat.messages.map(\.id), ["u1", "a2"])
+        XCTAssertEqual(chat.allMessages.count, 3)
+        XCTAssertEqual(chat.currentId, "a2")
+    }
 }

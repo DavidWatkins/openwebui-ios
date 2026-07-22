@@ -37,12 +37,14 @@ final class ChatStore: ObservableObject {
                 .map { var c = $0; c.pinned = true; return c } ?? []
             let pinnedIDs = Set(pinned.map(\.id))
             let server = pinned + regular.filter { !pinnedIDs.contains($0.id) }
+            localStore.cacheSummaries(server)   // keep the offline list fresh
             chats = sorted(local + server)
             error = nil
         } catch is CancellationError {
         } catch {
-            // Server down: still show local chats so on-device history stays usable.
-            chats = sorted(local)
+            // Server down: show local chats plus any cached server chats we've
+            // opened before, so past conversations stay readable offline.
+            chats = sorted(local + localStore.cachedSummaries())
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
@@ -55,6 +57,7 @@ final class ChatStore: ObservableObject {
         }
         do {
             try await client.deleteChat(chat.id)
+            localStore.deleteCached(id: chat.id)
             chats.removeAll { $0.id == chat.id }
         } catch { report(error) }
     }
@@ -179,6 +182,42 @@ final class LocalChat {
     }
 }
 
+/// On-device cache of a SERVER chat, so past conversations are readable with no
+/// connectivity. Distinct from `LocalChat` (device-only chats that never sync):
+/// these mirror real server chats, refreshed whenever the server is reachable.
+/// The full branching tree is stored so offline reads keep edit/regenerate history.
+@Model
+final class CachedServerChat {
+    @Attribute(.unique) var id: String
+    var title: String
+    var createdAt: Double
+    var updatedAt: Double
+    var pinned: Bool
+    var archived: Bool
+    var currentId: String?
+    private var modelsData: Data
+    private var treeData: Data
+
+    var models: [String] {
+        get { (try? JSONDecoder().decode([String].self, from: modelsData)) ?? [] }
+        set { modelsData = (try? JSONEncoder().encode(newValue)) ?? Data() }
+    }
+    /// Every node in the branching history (not just the active branch).
+    var tree: [OWMessage] {
+        get { (try? JSONDecoder().decode([OWMessage].self, from: treeData)) ?? [] }
+        set { treeData = (try? JSONEncoder().encode(newValue)) ?? Data() }
+    }
+    var hasHistory: Bool { !treeData.isEmpty && !tree.isEmpty }
+
+    init(id: String, title: String, createdAt: Double, updatedAt: Double,
+         pinned: Bool, archived: Bool, currentId: String?, models: [String], tree: [OWMessage]) {
+        self.id = id; self.title = title; self.createdAt = createdAt; self.updatedAt = updatedAt
+        self.pinned = pinned; self.archived = archived; self.currentId = currentId
+        self.modelsData = (try? JSONEncoder().encode(models)) ?? Data()
+        self.treeData = (try? JSONEncoder().encode(tree)) ?? Data()
+    }
+}
+
 /// Thin CRUD wrapper around the on-device SwiftData store. Kept as a manual
 /// store (not `@Query`) so it slots into the existing `ChatStore` merge logic.
 @MainActor
@@ -188,13 +227,13 @@ final class LocalChatStore {
 
     init() {
         // Fall back to an in-memory store if the on-disk one can't open, so a
-        // storage failure degrades to "local chats don't persist" rather than a
+        // storage failure degrades to "chats don't persist" rather than a
         // launch crash.
-        if let c = try? ModelContainer(for: LocalChat.self) {
+        if let c = try? ModelContainer(for: LocalChat.self, CachedServerChat.self) {
             container = c
         } else {
             let cfg = ModelConfiguration(isStoredInMemoryOnly: true)
-            container = try! ModelContainer(for: LocalChat.self, configurations: cfg)
+            container = try! ModelContainer(for: LocalChat.self, CachedServerChat.self, configurations: cfg)
         }
     }
 
@@ -242,5 +281,70 @@ final class LocalChatStore {
             OWChatSummary(id: $0.id, title: $0.title, updatedAt: $0.updatedAt,
                           createdAt: $0.createdAt, pinned: false, archived: false, isLocal: true)
         }
+    }
+
+    // MARK: - Server chat cache (offline read)
+
+    private func cached(id: String) -> CachedServerChat? {
+        let d = FetchDescriptor<CachedServerChat>(predicate: #Predicate { $0.id == id })
+        return try? ctx.fetch(d).first ?? nil
+    }
+
+    /// Refresh cached list metadata from a server fetch (keeps any cached history).
+    func cacheSummaries(_ list: [OWChatSummary]) {
+        for s in list {
+            if let e = cached(id: s.id) {
+                e.title = s.title
+                if let u = s.updatedAt { e.updatedAt = u }
+                if let c = s.createdAt { e.createdAt = c }
+                e.pinned = s.pinned; e.archived = s.archived
+            } else {
+                ctx.insert(CachedServerChat(id: s.id, title: s.title,
+                    createdAt: s.createdAt ?? 0, updatedAt: s.updatedAt ?? 0,
+                    pinned: s.pinned, archived: s.archived, currentId: nil, models: [], tree: []))
+            }
+        }
+        try? ctx.save()
+    }
+
+    /// Cached server chats that actually have history (i.e. were opened) — the set
+    /// that's genuinely readable offline, newest first.
+    func cachedSummaries() -> [OWChatSummary] {
+        let d = FetchDescriptor<CachedServerChat>(sortBy: [SortDescriptor(\.updatedAt, order: .reverse)])
+        return ((try? ctx.fetch(d)) ?? []).filter(\.hasHistory).map {
+            OWChatSummary(id: $0.id, title: $0.title, updatedAt: $0.updatedAt,
+                          createdAt: $0.createdAt, pinned: $0.pinned, archived: $0.archived, isLocal: false)
+        }
+    }
+
+    /// Store a chat's full history tree for offline reading.
+    func cacheChat(_ chat: OWChat) {
+        guard !chat.id.isEmpty else { return }
+        let nodes = chat.allMessages.isEmpty ? chat.messages : chat.allMessages
+        guard !nodes.isEmpty else { return }
+        if let e = cached(id: chat.id) {
+            if !chat.title.isEmpty { e.title = chat.title }
+            e.models = chat.models
+            e.tree = nodes
+            e.currentId = chat.currentId
+        } else {
+            let now = Date().timeIntervalSince1970
+            ctx.insert(CachedServerChat(id: chat.id, title: chat.title,
+                createdAt: now, updatedAt: now, pinned: false, archived: false,
+                currentId: chat.currentId, models: chat.models, tree: nodes))
+        }
+        try? ctx.save()
+    }
+
+    /// Reconstruct a cached server chat for offline reading (nil if none cached).
+    func cachedChat(id: String) -> OWChat? {
+        guard let e = cached(id: id), e.hasHistory else { return nil }
+        return OWChat(id: e.id, title: e.title, models: e.models,
+                      allMessages: e.tree, currentId: e.currentId)
+    }
+
+    func deleteCached(id: String) {
+        guard let e = cached(id: id) else { return }
+        ctx.delete(e); try? ctx.save()
     }
 }
