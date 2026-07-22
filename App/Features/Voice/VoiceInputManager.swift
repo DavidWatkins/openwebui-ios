@@ -145,7 +145,12 @@ final class VoiceInputManager: ObservableObject {
                 Task { @MainActor in
                     guard let self else { return }
                     if let result {
-                        self.partialText = result.bestTranscription.formattedString
+                        // Never overwrite a good transcript with an empty one — on an
+                        // abrupt stop SFSpeechRecognizer often delivers an EMPTY final
+                        // result, which used to wipe the live text → "didn't catch
+                        // any speech" even though we clearly heard the user.
+                        let s = result.bestTranscription.formattedString
+                        if !s.isEmpty { self.partialText = s }
                         if result.isFinal { self.sawFinal = true }
                     }
                     if let err { self.error = L("Reconhecimento: %@", err.localizedDescription); self.sawFinal = true }
@@ -185,15 +190,18 @@ final class VoiceInputManager: ObservableObject {
     func stop() async -> String {
         guard isRecording else { return "" }
         isRecording = false
-        tearDownEngine()
-        request?.endAudio()
-        deactivateSession()
+        tearDownEngine()       // stop the engine + tap first (no appends after endAudio)
+        request?.endAudio()    // then let the recognizer finalize the buffered audio
 
-        if useServer { return await transcribeWithServer() }
-        if useModel { return await transcribeWithWhisper() }
+        // Server/Whisper transcribe the captured raw samples — the session can go now.
+        if useServer { deactivateSession(); return await transcribeWithServer() }
+        if useModel { deactivateSession(); return await transcribeWithWhisper() }
 
+        // Native: wait for the final result BEFORE deactivating the session, so the
+        // recognizer can emit its last transcript.
         for _ in 0..<30 { if sawFinal { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
         task?.cancel(); task = nil; request = nil
+        deactivateSession()
         let text = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty && error == nil { error = L("Não captei nenhuma fala.") }
         return text

@@ -41,11 +41,13 @@ struct VoiceView: View {
                 theme.bg.ignoresSafeArea()
                 if theme.backdrop { ThemeBackdrop(theme: theme) }
                 VStack(spacing: 0) {
-                    transcript
-                    Spacer(minLength: 8)
+                    // Cap the transcript so the visualizer sits centered in the
+                    // screen rather than being shoved to the bottom.
+                    transcript.frame(maxHeight: 200)
+                    Spacer(minLength: 0)
                     orb
-                    statusLine
-                    Spacer(minLength: 8)
+                    statusLine.padding(.top, 6)
+                    Spacer(minLength: 0)
                     controlButton
                 }
                 .padding(16)
@@ -139,24 +141,29 @@ struct VoiceView: View {
         let amp = convo.phase == .listening ? CGFloat(min(max(convo.level, 0), 1)) : 0
         let active = convo.phase == .listening || convo.phase == .speaking
         return ZStack {
+            // Soft accent aura.
             Circle()
-                .fill(RadialGradient(colors: [theme.accent.opacity(0.35), .clear],
-                                     center: .center, startRadius: 20, endRadius: 150))
-                .frame(width: 300, height: 300)
-                .scaleEffect(breathe ? 1.06 : 0.9)
+                .fill(RadialGradient(colors: [theme.accent.opacity(0.32), .clear],
+                                     center: .center, startRadius: 20, endRadius: 170))
+                .frame(width: 320, height: 320)
+                .scaleEffect(breathe ? 1.05 : 0.92)
+            // Circular audio visualizer — bars radiate from a ring and react to
+            // your voice (and gently idle-pulse while speaking).
+            CircularVisualizer(level: amp, active: active, color: .white)
+                .frame(width: 280, height: 280)
+            // Glowing white core.
             Circle()
-                .fill(RadialGradient(colors: [.white, .white.opacity(0.85), .white.opacity(0.2)],
-                                     center: .init(x: 0.42, y: 0.40), startRadius: 6, endRadius: 120))
-                .frame(width: 176, height: 176)
-                .blur(radius: 3)
-                .overlay(Circle().stroke(.white.opacity(0.5), lineWidth: 1).blur(radius: 1))
-                .shadow(color: .white.opacity(active ? 0.6 : 0.3), radius: active ? 34 : 18)
-                .scaleEffect(0.9 + amp * 0.35 + (breathe ? 0.05 : 0))
+                .fill(RadialGradient(colors: [.white, .white.opacity(0.75), .white.opacity(0.12)],
+                                     center: .init(x: 0.42, y: 0.40), startRadius: 4, endRadius: 90))
+                .frame(width: 128, height: 128)
+                .blur(radius: 4)
+                .shadow(color: .white.opacity(active ? 0.6 : 0.28), radius: active ? 30 : 16)
+                .scaleEffect(0.9 + amp * 0.3 + (breathe ? 0.04 : 0))
             if convo.phase == .thinking {
                 ProgressView().tint(theme.accent).controlSize(.large)
             }
         }
-        .frame(height: 300)
+        .frame(height: 320)
         .contentShape(Circle())
         .onTapGesture { convo.tapOrb() }
         .animation(.easeOut(duration: 0.12), value: amp)
@@ -211,6 +218,46 @@ struct VoiceView: View {
                 Image(systemName: "chevron.up.chevron.down").font(.system(size: 8))
             }
             .foregroundStyle(theme.accent).frame(maxWidth: 140, alignment: .trailing)
+        }
+    }
+}
+
+/// A circular audio visualizer: bars radiate from a center ring, their length
+/// driven by the live mic level, with a traveling shimmer so it stays lively even
+/// at low input — the "circular equalizer" look. Redraws every frame via
+/// TimelineView while the voice screen is on.
+struct CircularVisualizer: View {
+    var level: CGFloat            // 0…1 live loudness
+    var active: Bool
+    var color: Color = .white
+    private let bars = 64
+
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            Canvas { ctx, size in
+                let c = CGPoint(x: size.width / 2, y: size.height / 2)
+                let ringR = min(size.width, size.height) * 0.30
+                let maxBar = min(size.width, size.height) * 0.17
+                for i in 0..<bars {
+                    let frac = Double(i) / Double(bars)
+                    let angle = frac * 2 * .pi - .pi / 2
+                    // Two traveling waves → a lively circular-equalizer shimmer.
+                    let shimmer = (sin(t * 3 + frac * .pi * 8) + sin(t * 2 + frac * .pi * 14)) / 2  // -1…1
+                    let norm = (shimmer + 1) / 2                                                    // 0…1
+                    let idle = active ? 0.14 : 0.06
+                    let react = Double(level) * (0.45 + 0.55 * norm)
+                    let h = maxBar * (idle + react)
+                    let inner = CGPoint(x: c.x + cos(angle) * ringR, y: c.y + sin(angle) * ringR)
+                    let outer = CGPoint(x: c.x + cos(angle) * (ringR + h), y: c.y + sin(angle) * (ringR + h))
+                    var p = Path(); p.move(to: inner); p.addLine(to: outer)
+                    ctx.stroke(p, with: .color(color.opacity(0.35 + 0.45 * norm)),
+                               style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                }
+                let ring = Path(ellipseIn: CGRect(x: c.x - ringR, y: c.y - ringR,
+                                                  width: ringR * 2, height: ringR * 2))
+                ctx.stroke(ring, with: .color(color.opacity(0.15)), lineWidth: 1)
+            }
         }
     }
 }
