@@ -2,7 +2,7 @@
 title: Agent
 author: openwebui-ios
 description: Server-side agentic tool loop via prompt-based tool calling. One model call decides + answers; if it emits a tool JSON the pipe runs the tool (SearXNG web search, Open-Meteo weather) and loops. Appends deduplicated citations. Exposes itself as a model so the plain /api/chat/completions API gets contextual tools with no socket.io. Auto-detects the loaded model to survive the router swap cooldown. NB: Open WebUI buffers pipe output over the REST API (no token streaming); a no-tool turn costs ~one base-model call, a tool turn ~two.
-version: 0.10.1
+version: 0.10.2
 required_open_webui_version: 0.6.0
 """
 import json
@@ -160,27 +160,35 @@ class Pipe:
 
     async def _model(self, request, user, messages,
                      think: Optional[bool] = None) -> Tuple[str, str]:
-        """Returns (content, reasoning). When thinking is on we stream internally
-        because Open WebUI's non-streaming response drops `reasoning_content` —
-        only the SSE deltas carry it — and we want the thinking for auditing."""
+        """Returns (content, reasoning).
+
+        When thinking is on we FIRST try a streaming call, because Open WebUI's
+        non-streaming response drops `reasoning_content` (only the SSE deltas carry
+        it) and we want the thinking for auditing. But that streaming call is
+        flaky — it intermittently comes back empty (a glitch, or a router cooldown
+        the stream swallows) — so if there's no answer we fall back to a plain
+        NON-streaming call, which returns text reliably. Reasoning is a bonus;
+        a real answer is not optional."""
         model = self._loaded_model or self.valves.base_model
         thinking = self.valves.enable_thinking if think is None else think
-        async def call(mid):
-            payload = {"model": mid, "messages": messages, "stream": bool(thinking),
+
+        async def call(mid, stream):
+            payload = {"model": mid, "messages": messages, "stream": stream,
                        "chat_template_kwargs": {"enable_thinking": thinking}}
             try:
                 resp = await generate_chat_completion(request, payload, user)
             except Exception as e:
                 return {"__err__": str(e)}
-            # Streaming (thinking on): aggregate content + reasoning from SSE deltas.
-            if hasattr(resp, "body_iterator"):
-                content, reasoning = "", ""
+            if stream and hasattr(resp, "body_iterator"):
+                content, reasoning, err = "", "", ""
                 async for chunk in resp.body_iterator:
                     if isinstance(chunk, (bytes, bytearray)):
                         chunk = chunk.decode("utf-8", "ignore")
                     for line in str(chunk).splitlines():
                         line = line.strip()
                         if not line.startswith("data:"):
+                            if '"detail"' in line or '"error"' in line:
+                                err += line   # cooldown/error may arrive un-prefixed
                             continue
                         p = line[5:].strip()
                         if p == "[DONE]":
@@ -192,8 +200,7 @@ class Pipe:
                         delta = (d.get("choices") or [{}])[0].get("delta", {}) or {}
                         reasoning += delta.get("reasoning_content") or delta.get("reasoning") or ""
                         content += delta.get("content") or ""
-                return {"__stream__": True, "content": content, "reasoning": reasoning}
-            # Non-streaming (thinking off): JSONResponse or dict.
+                return {"__stream__": True, "content": content, "reasoning": reasoning, "__err__": err}
             if isinstance(resp, dict):
                 return resp
             if hasattr(resp, "body"):
@@ -202,19 +209,43 @@ class Pipe:
                 except Exception:
                     return {}
             return {}
-        data = await call(model)
-        if "choices" not in data and "__stream__" not in data:  # router refused → retry loaded model
-            hit = _COOLDOWN_RE.search(str(data.get("detail") or data.get("error") or data.get("__err__") or ""))
-            if hit:
-                self._loaded_model = hit.group(1)
-                data = await call(self._loaded_model)
-        if data.get("__stream__"):
-            return data.get("content") or "", data.get("reasoning") or ""
-        try:
-            msg = data["choices"][0]["message"]
-            return (msg.get("content") or ""), (msg.get("reasoning_content") or "")
-        except (KeyError, IndexError, TypeError):
-            return "", ""
+
+        def extract(data):
+            if data.get("__stream__"):
+                return (data.get("content") or ""), (data.get("reasoning") or "")
+            try:
+                m = data["choices"][0]["message"]
+                return (m.get("content") or ""), (m.get("reasoning_content") or "")
+            except (KeyError, IndexError, TypeError):
+                return "", ""
+
+        def cooldown_model(data):
+            blob = str(data.get("detail") or data.get("error") or data.get("__err__") or "")
+            m = _COOLDOWN_RE.search(blob)
+            return m.group(1) if m else None
+
+        # 1) Preferred call — stream when thinking so we capture reasoning.
+        data = await call(model, bool(thinking))
+        cm = cooldown_model(data)
+        if cm:
+            self._loaded_model = cm
+            data = await call(cm, bool(thinking))
+        content, reasoning = extract(data)
+
+        # 2) No answer (empty stream, or a cooldown the stream ate) → reliable
+        #    non-streaming call, with its own cooldown retry.
+        if not content.strip():
+            alt = await call(self._loaded_model or model, False)
+            cm = cooldown_model(alt)
+            if cm:
+                self._loaded_model = cm
+                alt = await call(cm, False)
+            c2, r2 = extract(alt)
+            if c2.strip():
+                content = c2
+                reasoning = reasoning or r2
+
+        return content, reasoning
 
     async def pipe(self, body: dict, __user__=None, __request__=None, __event_emitter__=None):
         user = await Users.get_user_by_id(__user__["id"]) if isinstance(__user__, dict) else __user__
