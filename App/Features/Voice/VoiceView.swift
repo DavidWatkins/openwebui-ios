@@ -49,9 +49,9 @@ struct VoiceView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    if seed != nil {
-                        Button("Fechar") { convo.stop(); dismiss() }.foregroundStyle(theme.accent)
-                    } else if !convo.turns.isEmpty {
+                    // No "Close" here — the ✕ control at the bottom exits. Keep only
+                    // the new-conversation button for the standalone Voz screen.
+                    if seed == nil, !convo.turns.isEmpty {
                         Button { convo.reset() } label: { Image(systemName: "square.and.pencil") }
                     }
                 }
