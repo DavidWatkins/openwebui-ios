@@ -231,6 +231,17 @@ public actor OWSocket {
                                     results: data["results"] as? String ?? "", sources: srcs)
             }
             done = (data["done"] as? Bool) ?? false
+        case "source", "citation":
+            // Stock OWUI native web search / RAG emits sources one-per-event:
+            // { source: {name, id}, document: ["raw text", …] }.
+            let s = data["source"] as? [String: Any]
+            let name = s?["name"] as? String ?? ""
+            let sid = s?["id"] as? String ?? ""
+            let docs = (data["document"] as? [String]) ?? []
+            let url = sid.hasPrefix("http") ? sid : (name.hasPrefix("http") ? name : "")
+            let srcs = url.isEmpty ? [] : [OWSource(title: (name.hasPrefix("http") || name.isEmpty) ? url : name, url: url)]
+            toolUse = OWToolUse(action: "web_search", query: "",
+                                results: docs.joined(separator: "\n\n"), sources: srcs)
         case "chat:active":
             done = ((data["active"] as? Bool) == false)
         default:

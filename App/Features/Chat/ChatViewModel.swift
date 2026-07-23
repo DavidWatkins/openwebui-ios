@@ -688,10 +688,20 @@ final class ChatViewModel: ObservableObject {
     private func setReasoning(_ id: String, _ text: String) {
         if let i = index(of: id) { messages[i].reasoning = text }
     }
-    /// Append a completed tool run (dedup by id) so the auditable card appears live.
+    /// Append a completed tool run so the auditable card appears live. Native OWUI
+    /// web-search sources arrive one-per-event (no query) — merge those into a
+    /// single card; pipe cards (with a query) are appended as distinct runs.
     private func addToolUse(_ id: String, _ t: OWToolUse) {
         guard let i = index(of: id) else { return }
-        if !messages[i].toolUses.contains(where: { $0.id == t.id }) { messages[i].toolUses.append(t) }
+        if t.action == "web_search", t.query.isEmpty,
+           let j = messages[i].toolUses.firstIndex(where: { $0.action == "web_search" && $0.query.isEmpty }) {
+            var merged = messages[i].toolUses[j]
+            if !t.results.isEmpty { merged.results += (merged.results.isEmpty ? "" : "\n\n---\n\n") + t.results }
+            for s in t.sources where !merged.sources.contains(where: { $0.url == s.url }) { merged.sources.append(s) }
+            messages[i].toolUses[j] = merged
+        } else if !messages[i].toolUses.contains(where: { $0.id == t.id }) {
+            messages[i].toolUses.append(t)
+        }
     }
 
     // MARK: - Background completion + local notification

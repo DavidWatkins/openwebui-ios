@@ -49,6 +49,8 @@ extension OpenWebUIClient {
                                 // Transient progress ("🔧 …"); skip the terminal marker.
                                 continuation.yield(.status(s))
                             }
+                        case "source", "citation":
+                            if let t = ev.toolUse { continuation.yield(.toolUse(t)) }
                         case "chat:active":
                             if ev.done { continuation.yield(.done); continuation.finish() }
                         default:

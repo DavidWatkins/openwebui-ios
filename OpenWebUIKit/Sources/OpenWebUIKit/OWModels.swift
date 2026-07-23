@@ -192,6 +192,15 @@ struct OWStatusEntry: Codable {
     var done: Bool?
 }
 
+/// One entry of Open WebUI's NATIVE `sources` array (built-in web search / RAG,
+/// no custom pipe): `{ source: {name, id}, document: ["raw retrieved text", …] }`.
+/// This is what a stock OWUI emits, so tool cards work without the Agent pipe.
+struct OWNativeSource: Decodable {
+    struct Ref: Decodable { var name: String?; var id: String? }
+    var source: Ref?
+    var document: [String]?
+}
+
 /// an array of parts for multimodal; we flatten to text here (images handled by
 /// the attachments layer later).
 public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
@@ -226,7 +235,7 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, role, content, model, timestamp, files, parentId
-        case reasoning, reasoning_content, output, statusHistory
+        case reasoning, reasoning_content, output, statusHistory, sources
     }
 
     /// One block of the socket/pipe `output` array Open WebUI persists instead of
@@ -305,6 +314,29 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
             return OWToolUse(action: action, query: e.query ?? "",
                              results: e.results ?? "", sources: e.sources ?? [])
         }
+        // Stock OWUI (native web search / RAG, no pipe) exposes the same audit data
+        // in `sources`; synthesize a card from it when the pipe didn't provide one.
+        if toolUses.isEmpty, let native = try? c.decode([OWNativeSource].self, forKey: .sources), !native.isEmpty {
+            toolUses = [OWMessage.toolUse(fromNative: native)]
+        }
+    }
+
+    /// Fold Open WebUI's native `sources` (built-in web search / RAG) into a single
+    /// auditable card: the source URLs become tappable links, the `document` texts
+    /// become the retrieved context.
+    static func toolUse(fromNative sources: [OWNativeSource]) -> OWToolUse {
+        var docs: [String] = []
+        var srcs: [OWSource] = []
+        for n in sources {
+            docs += (n.document ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            let name = n.source?.name ?? "", id = n.source?.id ?? ""
+            let url = id.hasPrefix("http") ? id : (name.hasPrefix("http") ? name : "")
+            if !url.isEmpty, !srcs.contains(where: { $0.url == url }) {
+                srcs.append(OWSource(title: (name.hasPrefix("http") || name.isEmpty) ? url : name, url: url))
+            }
+        }
+        return OWToolUse(action: "web_search", query: "",
+                         results: String(docs.joined(separator: "\n\n---\n\n").prefix(4000)), sources: srcs)
     }
 
     public func encode(to encoder: Encoder) throws {

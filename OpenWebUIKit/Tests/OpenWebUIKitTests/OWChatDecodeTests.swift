@@ -101,4 +101,29 @@ final class OWChatDecodeTests: XCTestCase {
         XCTAssertEqual(chat.allMessages.count, 3)
         XCTAssertEqual(chat.currentId, "a2")
     }
+    /// Stock OWUI native web search (no pipe) exposes retrieved context in
+    /// `sources`; it should decode into an auditable web_search tool card.
+    func testNativeSourcesBecomeToolCard() throws {
+        let json = """
+        {
+          "id": "c1", "title": "t",
+          "chat": { "title": "t", "models": ["m"],
+            "history": { "currentId": "a1", "messages": {
+              "a1": { "id": "a1", "parentId": null, "role": "assistant", "content": "Go 1.24.",
+                      "sources": [
+                        { "source": {"name":"search_web","id":"search_web"}, "document": ["Go 1.24 released."] },
+                        { "source": {"name":"Downloads","id":"https://go.dev/dl/"}, "document": ["All releases page text."] }
+                      ] }
+            } } }
+        }
+        """
+        let chat = try JSONDecoder().decode(OWChat.self, from: Data(json.utf8))
+        let m = try XCTUnwrap(chat.messages.first { $0.role == .assistant })
+        XCTAssertEqual(m.toolUses.count, 1)
+        let card = try XCTUnwrap(m.toolUses.first)
+        XCTAssertEqual(card.action, "web_search")
+        XCTAssertTrue(card.results.contains("Go 1.24 released."))
+        XCTAssertTrue(card.results.contains("All releases page text."))
+        XCTAssertEqual(card.sources.first?.url, "https://go.dev/dl/")
+    }
 }
