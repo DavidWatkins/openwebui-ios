@@ -110,11 +110,10 @@ public enum OWRole: String, Codable, Sendable {
 }
 
 /// Splits inline `<think>…</think>` thinking out of assistant text. Open WebUI
-/// usually separates reasoning into its own channel, but the agent pipe re-attaches
-/// it as a leading `<think>` block for auditing, and some flows pass those tags
-/// through literally — so we defensively lift them into a separate disclosure
-/// rather than showing them as the reply. Also handles the Qwen-template case where
-/// the opening `<think>` was in the prompt, leaving only a trailing `</think>`.
+/// usually separates reasoning into its own channel, but some setups pass those
+/// tags through literally — so we defensively lift them into a separate disclosure
+/// rather than showing them as the reply. Also handles the case where the opening
+/// `<think>` was injected by the prompt template, leaving only a trailing `</think>`.
 enum OWReasoning {
     static func split(_ text: String) -> (content: String, reasoning: String?) {
         guard let close = text.range(of: "</think>") else { return (text, nil) }
