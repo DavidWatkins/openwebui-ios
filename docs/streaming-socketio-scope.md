@@ -7,8 +7,8 @@ but every chunk arrives at the client at once). So the Agent pipe can't stream
 token-by-token over `/api/chat/completions`. The web UI streams because it uses
 the **socket.io** flow. To get true streaming in the app, we replicate that.
 
-## Confirmed protocol (OWUI 0.10.2 source + live tests on chat.um.bot)
-1. **Connect** — websocket only to `wss://chat.um.bot/ws/socket.io`
+## Confirmed protocol (OWUI 0.10.2 source + live tests on your-owui-host.example)
+1. **Connect** — websocket only to `wss://your-owui-host.example/ws/socket.io`
    (`transport=polling` returns "Invalid transport"). Auth on connect:
    `auth: { token: <JWT> }`.
 2. **Register** — emit `user-join` with `{ auth: { token: <JWT> } }`; the server

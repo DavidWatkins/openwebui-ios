@@ -220,7 +220,8 @@ extension OpenWebUIClient {
     }
 
     static func cooldownModel(_ detail: String) -> String? {
-        // "router cooldown: qwen3.6-27b loaded 41s ago, will not swap to …"
+        // Some model routers reject a swap with e.g. "cooldown: <model> loaded 41s
+        // ago, will not swap …" — parse the loaded model so we can retry with it.
         guard let r = detail.range(of: #"cooldown:\s*(\S+)\s+loaded"#, options: .regularExpression) else { return nil }
         return detail[r].split(separator: " ").dropFirst().first.map(String.init)
     }
