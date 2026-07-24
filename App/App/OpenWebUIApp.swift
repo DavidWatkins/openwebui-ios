@@ -23,11 +23,23 @@ struct OpenWebUIApp: App {
                 .environment(\.layoutDirection, lang.layoutDirection)   // RTL for ar/fa/ur/ps
                 .preferredColorScheme(themes.theme.isDark ? .dark : .light)
                 .tint(themes.theme.accent)
-                // Font family is read by the non-View `Font.ody` helper via a
-                // global; bump identity so the whole tree re-renders on change.
-                // The language code is folded in so a language switch rebuilds
-                // the tree and re-resolves every localized string.
-                .id("\(themes.fontFamily)#\(lang.current.rawValue)")
+                // Dynamic Type is honored up to XXL; the accessibility sizes
+                // would overflow the composer/chips/toolbars. Appearance
+                // .scaledSize applies the same clamp to point-sized fonts.
+                .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+                // Keyed on the language code so a language switch rebuilds the
+                // tree and re-resolves every `L(_:)`-computed string (those read a
+                // global bundle SwiftUI can't observe). Language changes are rare
+                // and happen from a dedicated screen, so the rebuild is fine there.
+                //
+                // Font is deliberately NOT in this id: it used to be, but changing
+                // font then reset the whole tree's identity and tore down whatever
+                // was on screen — including the theme/appearance picker mid-use
+                // (the "picking a font exits the chooser" bug). Font still updates
+                // live on the active screen via ThemeStore observation; a theme
+                // switch (which also sets the font) refreshes everything through
+                // the `\.theme` environment.
+                .id(lang.current.rawValue)
                 #if os(macOS)
                 // The app draws its own controls; suppress AppKit's default
                 // bordered chrome, and give the window desktop-sized bounds.
@@ -47,6 +59,9 @@ struct RootView: View {
     @EnvironmentObject private var app: AppState
     @EnvironmentObject private var themes: ThemeStore
     @Environment(\.theme) private var theme
+    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject private var launch = AppLaunch.shared
+    @State private var showVoice = false
 
     var body: some View {
         ZStack {
@@ -74,6 +89,33 @@ struct RootView: View {
             SpeechManager.shared.client = app.client   // enables server-side TTS
             await app.bootstrap()
         }
+        // Action Button / Siri → the voice intent flips this. Present voice once
+        // signed in (a request during cold launch waits for .main). New-chat /
+        // camera intents are routed by MainView.
+        #if os(iOS)
+        .fullScreenCover(isPresented: $showVoice) { VoiceView(app: app) }
+        .onChange(of: launch.action) { _, _ in maybePresentVoice() }
+        .onChange(of: app.phase) { _, _ in maybePresentVoice() }
+        // Share Extension → the app opens via openwebui://share; also poll the
+        // App Group inbox on activation in case the URL open didn't reach us.
+        .onOpenURL { url in
+            if url.scheme == "openwebui", url.host == "share" { consumePendingShare() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { consumePendingShare() }
+        }
+        #endif
+    }
+
+    private func maybePresentVoice() {
+        guard launch.action == .voice, app.phase == .main else { return }
+        showVoice = true
+        launch.consume()
+    }
+
+    private func consumePendingShare() {
+        guard let item = SharedInbox.take() else { return }
+        launch.requestShare(item)
     }
 }
 

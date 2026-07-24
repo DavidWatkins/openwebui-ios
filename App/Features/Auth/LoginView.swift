@@ -17,65 +17,91 @@ struct LoginView: View {
             theme.bg.ignoresSafeArea()
             BackgroundDots().opacity(0.5)
 
+            #if os(macOS)
+            // Mac: the form floats as a centered card over the dotted backdrop —
+            // a full-window column reads like a stretched iPhone screen.
+            formColumn
+                .padding(28)
+                .frame(maxWidth: 380)
+                .background(theme.panel, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(theme.border, lineWidth: 1))
+            #else
             VStack(spacing: 22) {
                 Spacer(minLength: 40)
-                VStack(spacing: 10) {
-                    BrandMark(size: 64)
-                    Text("Open WebUI")
-                        .font(.ody(.largeTitle, design: .monospaced).weight(.semibold))
-                        .foregroundStyle(theme.fg)
-                    Text(serverLabel)
-                        .font(.ody(.footnote, design: .monospaced))
-                        .foregroundStyle(ServerConfig.isConfigured ? theme.secondaryText : theme.accent)
-                        .onTapGesture { showServerSheet = true }
-                }
-
-                VStack(spacing: 14) {
-                    field(title: "Email", text: $email, field: .email)
-                        .textContentType(.emailAddress)
-                        .keyboardType(.emailAddress)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .submitLabel(.next)
-                        .onSubmit { focus = .pass }
-
-                    secureField(title: "Senha", text: $password, field: .pass)
-                        .submitLabel(.go)
-                        .onSubmit(submit)
-                }
-                .padding(.horizontal, 4)
-
-                if let err = app.loginError {
-                    Text(err)
-                        .font(.ody(.footnote, design: .monospaced))
-                        .foregroundStyle(theme.accent)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                Button(action: submit) {
-                    HStack {
-                        if app.loggingIn { ProgressView().tint(.white) }
-                        Text("Entrar").font(.ody(.headline, design: .monospaced))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(theme.accent, in: RoundedRectangle(cornerRadius: 12))
-                    .foregroundStyle(.white)
-                }
-                .disabled(app.loggingIn || email.isEmpty || password.isEmpty || !ServerConfig.isConfigured)
-                .opacity(app.loggingIn || email.isEmpty || password.isEmpty || !ServerConfig.isConfigured ? 0.6 : 1)
-
+                formColumn
                 Spacer()
             }
             .frame(maxWidth: 420)
             .padding(24)
+            #endif
         }
         .sheet(isPresented: $showServerSheet) { ServerSheet().environmentObject(app) }
         .onAppear {
             if email.isEmpty { email = app.savedEmail ?? "" }
             // First run (no server saved yet) → prompt for it right away.
             if !ServerConfig.isConfigured { showServerSheet = true }
+            #if os(macOS)
+            // Land the cursor in the first field (next tick — the window may not
+            // be key yet when onAppear fires).
+            DispatchQueue.main.async { focus = .email }
+            #endif
+        }
+    }
+
+    private var formColumn: some View {
+        VStack(spacing: 22) {
+            VStack(spacing: 10) {
+                BrandMark(size: 64)
+                Text("Open WebUI")
+                    .font(.ody(.largeTitle, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(theme.fg)
+                // A real Button (not a tap gesture) so it's hoverable/focusable.
+                Button { showServerSheet = true } label: {
+                    Text(serverLabel)
+                        .font(.ody(.footnote, design: .monospaced))
+                        .foregroundStyle(ServerConfig.isConfigured ? theme.secondaryText : theme.accent)
+                }
+                .buttonStyle(.plain)
+            }
+
+            VStack(spacing: 14) {
+                field(title: "Email", text: $email, field: .email)
+                    .textContentType(.emailAddress)
+                    .keyboardType(.emailAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.next)
+                    .onSubmit { focus = .pass }
+
+                secureField(title: "Senha", text: $password, field: .pass)
+                    .submitLabel(.go)
+                    .onSubmit(submit)
+            }
+            .padding(.horizontal, 4)
+
+            if let err = app.loginError {
+                Text(err)
+                    .font(.ody(.footnote, design: .monospaced))
+                    .foregroundStyle(theme.danger)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Button(action: submit) {
+                HStack {
+                    if app.loggingIn { ProgressView().tint(theme.onAccent) }
+                    Text("Entrar").font(.ody(.headline, design: .monospaced))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(theme.accent, in: RoundedRectangle(cornerRadius: 12))
+                .foregroundStyle(theme.onAccent)
+            }
+            #if os(macOS)
+            .keyboardShortcut(.defaultAction)
+            #endif
+            .disabled(app.loggingIn || email.isEmpty || password.isEmpty || !ServerConfig.isConfigured)
+            .opacity(app.loggingIn || email.isEmpty || password.isEmpty || !ServerConfig.isConfigured ? 0.6 : 1)
         }
     }
 
@@ -113,16 +139,7 @@ struct LoginView: View {
     }
 }
 
-private extension View {
-    func styledInput(_ theme: Theme) -> some View {
-        self
-            .font(.ody(.body, design: .monospaced))
-            .foregroundStyle(theme.fg)
-            .padding(.horizontal, 14).padding(.vertical, 12)
-            .background(theme.panel, in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.border, lineWidth: 1))
-    }
-}
+// (styledInput moved to App/Config/InputStyle.swift — ServerSheet shares it.)
 
 /// Subtle dotted background matching the web login's "dots" pattern.
 struct BackgroundDots: View {

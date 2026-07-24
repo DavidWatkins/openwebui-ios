@@ -17,8 +17,12 @@ final class BargeInMonitor {
     /// speech (not a transient). `threshold` comes from the user's sensitivity
     /// setting (higher sensitivity → lower threshold → easier to interrupt).
     nonisolated(unsafe) private var threshold: Float = 0.07
-    private let hotNeeded = 4
+    private let hotNeeded = 7                    // sustained speech, not a blip
     nonisolated(unsafe) private var hotCount = 0
+    // Ignore the first ~1s of the reply so the TTS ramp / residual echo can't trip
+    // a false interruption that clips the end of the assistant's sentence.
+    nonisolated(unsafe) private var warmup = 0
+    private let warmupBuffers = 24
 
     static func thresholdForSensitivity(_ s: Double) -> Float {
         Float(0.13 - max(0, min(1, s)) * 0.11)   // s=0 → 0.13 (hard), s=1 → 0.02 (easy)
@@ -31,6 +35,7 @@ final class BargeInMonitor {
         guard !running else { return }
         self.onSpeech = onSpeech
         hotCount = 0
+        warmup = 0
         let s = UserDefaults.standard.object(forKey: "voice.bargein.sensitivity") as? Double ?? 0.5
         threshold = Self.thresholdForSensitivity(s)
         engine = AVAudioEngine()   // fresh engine each time (reuse is unstable)
@@ -61,6 +66,7 @@ final class BargeInMonitor {
         let n = Int(buffer.frameLength); guard n > 0 else { return }
         var sum: Float = 0
         for i in 0..<n { let s = ch[i]; sum += s * s }
+        if warmup < warmupBuffers { warmup += 1; return }
         let rms = (sum / Float(n)).squareRoot()
         if rms > threshold {
             hotCount += 1

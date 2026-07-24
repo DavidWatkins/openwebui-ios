@@ -23,6 +23,13 @@ final class VoiceConversation: ObservableObject {
     @Published var reply = ""           // streaming assistant reply
     @Published var error: String?
     @Published var model: String?
+    /// Live mic loudness (0…1) — used internally for energy endpointing. NOT
+    /// @Published: it changes many times/sec and the view doesn't read it, so
+    /// publishing it just churned re-renders.
+    private var level: Float = 0
+    /// Live FFT bands for the visualizer — a plain reference the Canvas reads each
+    /// frame (see SpectrumSource) so the fast audio updates don't re-render the view.
+    let spectrumSource = SpectrumSource()
     /// Per-conversation server TTS voice ("" = global default). Persisted per chat.
     @Published var ttsVoice: String = ""
 
@@ -38,6 +45,15 @@ final class VoiceConversation: ObservableObject {
     /// Server chat this voice session is being saved to (created on first reply).
     private var chatID: String?
 
+    /// When set (voice launched from a chat), completed turns are handed to the
+    /// host `ChatViewModel` instead of being saved here — so voice and text share
+    /// one thread, carry over both ways, and honor the chat's mode (server/local/
+    /// temporary). nil = legacy standalone behaviour (self-persist to the server).
+    var onCommit: (([OWMessage]) -> Void)?
+    /// Supplies the ambient-context system message (date/time, location, custom
+    /// instructions), evaluated per turn. Set by VoiceView from AppState.
+    var contextProvider: (() -> OWChatMessageInput?)?
+
     private var cancellables = Set<AnyCancellable>()
     private var silenceTimer: Timer?
     private var lastPartial = ""
@@ -45,11 +61,12 @@ final class VoiceConversation: ObservableObject {
     // Energy-based endpointing (for engines with no live transcript).
     private var heardSpeech = false
     private var lastLoud = Date()
-    private let speechLevel: Float = 0.04
-    private var sttIsNative: Bool {
-        let e = UserDefaults.standard.string(forKey: "voice.stt.engine")
-        return e != "model" && e != "server"
-    }
+    // Matched to VoiceInputManager's boosted 0…1 level: a normal voice reads
+    // ~0.35–0.6, room noise ~0.05–0.15, so this cleanly separates speech.
+    private let speechLevel: Float = 0.22
+    // The conversation forces the native engine (see init), so endpointing always
+    // uses the live-transcript path: end the turn on a pause after real words.
+    private let sttIsNative = true
     private var streamTask: Task<Void, Never>?
     private var speakingTurnID = ""
 
@@ -58,14 +75,30 @@ final class VoiceConversation: ObservableObject {
     /// user taps the orb to end the turn).
     private let endpointSilence: TimeInterval = 1.6
 
+    /// Mic-based barge-in (talk over the reply to interrupt). OFF by default: it
+    /// needs a duplex `.voiceChat` session + a second audio engine for echo
+    /// cancellation, which glitched the tail of the spoken reply. You can still
+    /// interrupt by tapping the orb. Opt in via the Settings toggle.
+    private var bargeInEnabled: Bool {
+        UserDefaults.standard.object(forKey: "voice.bargein.enabled") as? Bool ?? false
+    }
+
     private var seeded = false
 
-    init(client: OpenWebUIClient, completions: ChatCompletionsClient, models: [OWModel]) {
+    init(client: OpenWebUIClient, completions: ChatCompletionsClient, models: [OWModel],
+         defaultModel: String? = nil) {
         self.client = client
         self.completions = completions
         self.models = models
-        self.model = models.first?.id
+        // Voice needs tools (weather / web search), so prefer the fast Agent model;
+        // fall back to the user's default. The picker still overrides per session.
+        self.model = models.first { $0.id.hasSuffix(".agent") || $0.name == "Agent (tools)" }?.id
+            ?? defaultModel ?? models.first?.id
         voice.client = client   // enables the "server" STT engine
+        // The live conversation forces on-device recognition: it's the only engine
+        // that streams partial transcripts (so you see your words as you speak) and
+        // that we can auto-endpoint on a pause without a manual tap.
+        voice.engineOverride = "native"
         voice.$partialText
             .receive(on: RunLoop.main)
             .sink { [weak self] t in self?.partialChanged(t) }
@@ -73,6 +106,13 @@ final class VoiceConversation: ObservableObject {
         voice.$level
             .receive(on: RunLoop.main)
             .sink { [weak self] lvl in self?.levelChanged(lvl) }
+            .store(in: &cancellables)
+        voice.$spectrum
+            .receive(on: RunLoop.main)
+            .sink { [weak self] s in
+                guard let self else { return }
+                self.spectrumSource.set(self.phase == .listening ? s : [])
+            }
             .store(in: &cancellables)
         voice.$error
             .receive(on: RunLoop.main)
@@ -93,6 +133,16 @@ final class VoiceConversation: ObservableObject {
 
     func toggleSession() {
         if active { stop() } else { Task { await startSession() } }
+    }
+
+    /// Mute/unmute the mic without ending the session (ChatGPT-style). While muted
+    /// the input is discarded and endpointing is paused.
+    @Published var muted = false
+    func toggleMute() {
+        muted.toggle()
+        voice.muted = muted
+        if muted { liveText = "" }        // drop the in-progress partial
+        else { lastChange = Date(); lastLoud = Date() }   // reset the pause clock
     }
 
     /// Loads an existing server chat so voice continues it (one-time, used when
@@ -130,7 +180,9 @@ final class VoiceConversation: ObservableObject {
     func startSession() async {
         guard !active else { return }
         active = true; error = nil; reply = ""
-        tts.duplexSession = true   // play-AND-record so barge-in can listen mid-reply
+        // Duplex (play-AND-record) only when mic barge-in is on; otherwise a clean
+        // `.playback` session so the spoken reply doesn't glitch at the end.
+        tts.duplexSession = bargeInEnabled
         enableProximity()
         await listen()
     }
@@ -204,12 +256,16 @@ final class VoiceConversation: ObservableObject {
     }
 
     private func levelChanged(_ lvl: Float) {
+        // Throttle UI churn: only republish on a meaningful change so the orb's
+        // (blur/shadow) layers don't re-render on every audio callback.
+        let next: Float = (phase == .listening) ? lvl : 0
+        if abs(next - level) > 0.02 { level = next }
         guard phase == .listening else { return }
         if lvl > speechLevel { heardSpeech = true; lastLoud = Date() }
     }
 
     private func checkSilence() {
-        guard phase == .listening else { return }
+        guard phase == .listening, !muted else { return }
         if sttIsNative {
             // Native has a live transcript — end on a pause after real words.
             guard !lastPartial.isEmpty else { return }
@@ -242,8 +298,18 @@ final class VoiceConversation: ObservableObject {
         guard let model else { error = L("Nenhum modelo disponível."); phase = .idle; return }
         phase = .thinking
         reply = ""
-        var msgs = [OWChatMessageInput(role: "system", text: Self.systemPrompt)]
-        for t in turns { msgs.append(OWChatMessageInput(role: t.role, text: t.text)) }
+        // Ambient context (date/time, location, custom instructions) — same as the
+        // typed chat; voice was missing it entirely.
+        var msgs: [OWChatMessageInput] = []
+        if let ctx = contextProvider?() { msgs.append(ctx) }
+        // The voice style/brevity hint rides on the LAST user turn (in the copy
+        // sent to the model, not the stored turn). A competing SYSTEM persona
+        // suppressed the Agent's tools — a user-turn hint doesn't.
+        let lastUserIdx = turns.lastIndex(where: { $0.role == "user" })
+        for (i, t) in turns.enumerated() {
+            let text = (i == lastUserIdx) ? "\(t.text)\n\n(\(Self.voiceHint))" : t.text
+            msgs.append(OWChatMessageInput(role: t.role, text: text))
+        }
         let replyTurn = Turn(role: "assistant", text: "")
         turns.append(replyTurn)
         speakingTurnID = replyTurn.id
@@ -256,18 +322,40 @@ final class VoiceConversation: ObservableObject {
                     case .textDelta(let d):
                         self.reply += d
                         if let i = self.turns.lastIndex(where: { $0.id == replyTurn.id }) {
-                            self.turns[i].text = self.reply
+                            self.turns[i].text = Self.cleanReply(self.reply)
                         }
                     case .error(let m): self.error = m
                     default: break
                     }
                 }
-                await self.persist()
+                self.commit()
                 self.speak()
             } catch {
                 self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 self.afterSpeaking()
             }
+        }
+    }
+
+    /// Turns rendered as chat messages (drops empty ones).
+    private func currentMessages() -> [OWMessage] {
+        turns.compactMap { t in
+            let txt = t.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !txt.isEmpty else { return nil }
+            return OWMessage(id: t.id,
+                             role: t.role == "user" ? .user : .assistant,
+                             content: txt,
+                             model: t.role == "user" ? nil : model,
+                             timestamp: t.at.timeIntervalSince1970)
+        }
+    }
+
+    /// Hand the turn off to the host chat if attached; otherwise self-persist.
+    private func commit() {
+        if let onCommit {
+            onCommit(currentMessages())
+        } else {
+            Task { await persist() }
         }
     }
 
@@ -302,16 +390,26 @@ final class VoiceConversation: ObservableObject {
 
     // MARK: - Speak (TTS)
 
+    /// Clean a reply for speaking + display: drop the Agent's appended Sources
+    /// block and markdown syntax, and trim the leading blank lines (the "space
+    /// above the text") that thinking-off replies start with.
+    static func cleanReply(_ raw: String) -> String {
+        var s = raw
+        if let r = s.range(of: "\n\n---", options: .backwards) { s = String(s[..<r.lowerBound]) }
+        s = s.replacingOccurrences(of: #"\[([^\]]+)\]\([^)]+\)"#, with: "$1", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"[*_`#>]"#, with: "", options: .regularExpression)
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func speak() {
-        let t = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = Self.cleanReply(reply)
         guard active, !t.isEmpty else { afterSpeaking(); return }
         phase = .speaking
         tts.voiceOverride = ttsVoice.isEmpty ? nil : ttsVoice
         tts.onSpeechFinished = { [weak self] in self?.afterSpeaking() }
         tts.toggle(t, id: speakingTurnID)
-        // Listen for the user cutting in (barge-in) while the reply plays.
-        let bargeOn = UserDefaults.standard.object(forKey: "voice.bargein.enabled") as? Bool ?? true
-        if bargeOn { bargeMonitor.start { [weak self] in self?.bargeIn() } }
+        // Listen for the user cutting in (barge-in) while the reply plays — opt-in.
+        if bargeInEnabled { bargeMonitor.start { [weak self] in self?.bargeIn() } }
     }
 
     /// User started talking over the reply → stop speaking and listen.
@@ -327,12 +425,24 @@ final class VoiceConversation: ObservableObject {
         bargeMonitor.stop()
         tts.onSpeechFinished = nil
         guard active else { phase = .idle; return }
-        Task { await listen() }
+        // Let the playback tail drain before switching the session back to record —
+        // an immediate switch clips/repeats the last hardware buffer (the end click).
+        Task {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard self.active, self.phase != .listening else { return }
+            await self.listen()
+        }
     }
 
-    static let systemPrompt = """
-    Você é um companheiro de voz amigável, falando português do Brasil. \
-    Responda de forma curta e natural (1 a 3 frases), como numa conversa falada. \
-    Nada de listas, markdown ou emojis — apenas fala fluida.
-    """
+    /// Follows the app's selected UI language instead of forcing pt-BR — the
+    /// prompt previously hard-coded "falando português do Brasil", so the agent
+    /// always replied in Portuguese regardless of the user's language.
+    /// Style/brevity/language hint appended to the user's spoken turn (not a system
+    /// prompt — that suppressed the Agent's tools). Phrased as final-answer guidance
+    /// so it never blocks a tool call.
+    static var voiceHint: String {
+        let language = LanguageManager.shared.current.endonym   // e.g. "English", "Português"
+        return "Spoken conversation: use your tools for anything current or factual, "
+            + "then reply in \(language) as 1–2 short natural sentences — no lists, markdown, or emoji."
+    }
 }

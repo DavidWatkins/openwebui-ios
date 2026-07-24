@@ -85,8 +85,15 @@ struct WorkspaceView: View {
                 }
             }
         } header: {
-            Label("\(title) (\(rows.count))", systemImage: icon)
-                .font(.ody(.caption, design: .monospaced)).foregroundStyle(theme.secondaryText)
+            // Localize the title, then append the count verbatim. The old
+            // `Label("\(title) (\(count))", …)` passed an interpolated runtime
+            // String, which never localizes — so "Modelos"/"Conhecimento" leaked.
+            Label {
+                Text(LocalizedStringKey(title)) + Text(verbatim: " (\(rows.count))")
+            } icon: {
+                Image(systemName: icon)
+            }
+            .font(.ody(.caption, design: .monospaced)).foregroundStyle(theme.secondaryText)
         }
     }
 }

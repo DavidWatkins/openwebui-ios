@@ -109,6 +109,27 @@ public enum OWRole: String, Codable, Sendable {
     }
 }
 
+/// Splits inline `<think>…</think>` thinking out of assistant text. Open WebUI
+/// usually separates reasoning into its own channel, but some setups pass those
+/// tags through literally — so we defensively lift them into a separate disclosure
+/// rather than showing them as the reply. Also handles the case where the opening
+/// `<think>` was injected by the prompt template, leaving only a trailing `</think>`.
+enum OWReasoning {
+    static func split(_ text: String) -> (content: String, reasoning: String?) {
+        guard let close = text.range(of: "</think>") else { return (text, nil) }
+        let head = String(text[..<close.lowerBound])
+        let tail = String(text[close.upperBound...])
+        let think: String
+        if let open = head.range(of: "<think>") {
+            think = String(head[open.upperBound...])
+        } else {
+            think = head   // unclosed opening tag (template injected it)
+        }
+        let r = think.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (tail.trimmingCharacters(in: .whitespacesAndNewlines), r.isEmpty ? nil : r)
+    }
+}
+
 /// One element of a multimodal `content` array
 /// (e.g. [{type:"text", text:"…"}, {type:"image_url", image_url:{url:"data:…"}}]).
 struct OWContentPart: Decodable {
@@ -124,6 +145,61 @@ struct OWContentPart: Decodable {
 struct OWFileRef: Decodable { var type: String?; var url: String? }
 
 /// A chat message. Open WebUI stores `content` as a plain string for text and as
+/// A source cited by a tool run (web search result).
+public struct OWSource: Codable, Hashable, Sendable {
+    public var title: String
+    public var url: String
+    public init(title: String, url: String) { self.title = title; self.url = url }
+}
+
+/// An auditable record of one tool the Agent ran — the query it used and the raw
+/// context it got back — reconstructed from the message's `statusHistory`. Lets
+/// the UI show Claude-style, expandable "searched X → here's what it saw" cards.
+public struct OWToolUse: Identifiable, Hashable, Sendable {
+    public var action: String        // "web_search" | "weather" | …
+    public var query: String
+    public var results: String       // the raw text the model was given
+    public var sources: [OWSource]
+    public var id: String { "\(action)|\(query)|\(sources.count)|\(results.count)" }
+    public var title: String {
+        switch action {
+        case "web_search": return query.isEmpty ? "Web search" : query
+        case "weather":    return query.isEmpty ? "Weather" : query
+        default:           return action
+        }
+    }
+    public var icon: String {
+        switch action {
+        case "web_search": return "magnifyingglass"
+        case "weather":    return "cloud.sun"
+        default:           return "wrench.and.screwdriver"
+        }
+    }
+    public init(action: String, query: String, results: String, sources: [OWSource]) {
+        self.action = action; self.query = query; self.results = results; self.sources = sources
+    }
+}
+
+/// One `statusHistory` entry as Open WebUI stores it. The Agent pipe adds the
+/// rich `action`/`query`/`results`/`sources` fields on tool-run entries.
+struct OWStatusEntry: Codable {
+    var action: String?
+    var query: String?
+    var results: String?
+    var sources: [OWSource]?
+    var description: String?
+    var done: Bool?
+}
+
+/// One entry of Open WebUI's NATIVE `sources` array (built-in web search / RAG,
+/// no custom pipe): `{ source: {name, id}, document: ["raw retrieved text", …] }`.
+/// This is what a stock OWUI emits, so tool cards work without the Agent pipe.
+struct OWNativeSource: Decodable {
+    struct Ref: Decodable { var name: String?; var id: String? }
+    var source: Ref?
+    var document: [String]?
+}
+
 /// an array of parts for multimodal; we flatten to text here (images handled by
 /// the attachments layer later).
 public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
@@ -138,16 +214,37 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
     public var imageURLs: [String]
     /// Non-image attachments (documents → RAG).
     public var documents: [OWAttachment]
+    /// Extended-thinking text emitted before the reply, for models that expose it.
+    /// nil = the model never sent any (renders nothing), "" = it started and we
+    /// are still streaming the first token.
+    public var reasoning: String?
+    /// Auditable tool runs (from statusHistory) — the searches/lookups behind this
+    /// reply, each with its query, raw results, and sources.
+    public var toolUses: [OWToolUse]
 
     public init(id: String = UUID().uuidString, role: OWRole, content: String,
                 model: String? = nil, timestamp: Double? = nil,
-                imageURLs: [String] = [], documents: [OWAttachment] = []) {
+                imageURLs: [String] = [], documents: [OWAttachment] = [],
+                reasoning: String? = nil, toolUses: [OWToolUse] = []) {
         self.id = id; self.role = role; self.content = content
         self.model = model; self.timestamp = timestamp
         self.imageURLs = imageURLs; self.documents = documents
+        self.reasoning = reasoning; self.toolUses = toolUses
     }
 
-    enum CodingKeys: String, CodingKey { case id, role, content, model, timestamp, files, parentId }
+    enum CodingKeys: String, CodingKey {
+        case id, role, content, model, timestamp, files, parentId
+        case reasoning, reasoning_content, output, statusHistory, sources
+    }
+
+    /// One block of the socket/pipe `output` array Open WebUI persists instead of
+    /// a plain `content` string: `{ type: "message" | "reasoning", content: [...] }`.
+    /// Server chats replied to over the socket store their text here and leave
+    /// `content` empty, so we reconstruct both the answer and the thinking from it.
+    private struct OWOutputBlock: Decodable {
+        var type: String?
+        var content: [OWContentPart]?
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -174,9 +271,71 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
         imageURLs = imgs
         documents = docs
 
+        // Socket/pipe replies persist as an `output` block array with `content`
+        // left empty. Rebuild the answer from `message` blocks and the thinking
+        // from `reasoning` blocks — without this, server chats look empty on reload.
+        var outputReasoning: String?
+        if content.isEmpty, let blocks = try? c.decode([OWOutputBlock].self, forKey: .output) {
+            var answer = "", reason = ""
+            for b in blocks {
+                let joined = (b.content ?? []).compactMap(\.text).joined()
+                if b.type == "reasoning" { reason += joined } else { answer += joined }
+            }
+            if !answer.isEmpty { content = answer }
+            if !reason.isEmpty { outputReasoning = reason }
+        }
+
         model = try? c.decodeIfPresent(String.self, forKey: .model)
         timestamp = try? c.decode(Double.self, forKey: .timestamp)
         parentId = try? c.decodeIfPresent(String.self, forKey: .parentId)
+
+        // Any inline <think> tags (agent pipe re-attaches reasoning this way, and
+        // some flows pass them through literally) belong in the disclosure, not the reply.
+        var inlineReasoning: String?
+        if content.contains("</think>") {
+            let split = OWReasoning.split(content)
+            content = split.content
+            inlineReasoning = split.reasoning
+        }
+
+        // Open WebUI is inconsistent about which key holds thinking text, and the
+        // streaming delta uses both too (see ChatCompletionsClient). Accept either;
+        // treat an empty string as absent so the disclosure doesn't render blank.
+        let think = (try? c.decodeIfPresent(String.self, forKey: .reasoning))
+            ?? (try? c.decodeIfPresent(String.self, forKey: .reasoning_content))
+            ?? outputReasoning ?? inlineReasoning
+        reasoning = (think?.isEmpty == false) ? think : nil
+
+        // Auditable tool runs live in statusHistory — the rich entries carry `action`.
+        let entries: [OWStatusEntry] = (try? c.decode([OWStatusEntry].self, forKey: .statusHistory)) ?? []
+        toolUses = entries.compactMap { e in
+            guard let action = e.action else { return nil }
+            return OWToolUse(action: action, query: e.query ?? "",
+                             results: e.results ?? "", sources: e.sources ?? [])
+        }
+        // Stock OWUI (native web search / RAG, no pipe) exposes the same audit data
+        // in `sources`; synthesize a card from it when the pipe didn't provide one.
+        if toolUses.isEmpty, let native = try? c.decode([OWNativeSource].self, forKey: .sources), !native.isEmpty {
+            toolUses = [OWMessage.toolUse(fromNative: native)]
+        }
+    }
+
+    /// Fold Open WebUI's native `sources` (built-in web search / RAG) into a single
+    /// auditable card: the source URLs become tappable links, the `document` texts
+    /// become the retrieved context.
+    static func toolUse(fromNative sources: [OWNativeSource]) -> OWToolUse {
+        var docs: [String] = []
+        var srcs: [OWSource] = []
+        for n in sources {
+            docs += (n.document ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            let name = n.source?.name ?? "", id = n.source?.id ?? ""
+            let url = id.hasPrefix("http") ? id : (name.hasPrefix("http") ? name : "")
+            if !url.isEmpty, !srcs.contains(where: { $0.url == url }) {
+                srcs.append(OWSource(title: (name.hasPrefix("http") || name.isEmpty) ? url : name, url: url))
+            }
+        }
+        return OWToolUse(action: "web_search", query: "",
+                         results: String(docs.joined(separator: "\n\n---\n\n").prefix(4000)), sources: srcs)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -186,9 +345,27 @@ public struct OWMessage: Codable, Identifiable, Hashable, Sendable {
         try c.encode(content, forKey: .content)
         try c.encodeIfPresent(model, forKey: .model)
         try c.encodeIfPresent(timestamp, forKey: .timestamp)
+        // Persist the branch link so a cached history tree survives a round-trip
+        // (without this the offline cache would flatten every conversation).
+        try c.encodeIfPresent(parentId, forKey: .parentId)
+        // Persist thinking so it survives a history reload. `reasoning_content` is
+        // the OpenAI-compatible name the backend pipes through; the decoder above
+        // also accepts `reasoning`, so our own round-trip works either way.
+        if let reasoning, !reasoning.isEmpty {
+            try c.encode(reasoning, forKey: .reasoning_content)
+        }
         var files = imageURLs.map { OWAttachment(type: "image", url: $0) }
         files += documents
         if !files.isEmpty { try c.encode(files, forKey: .files) }
+        // Round-trip the tool cards through statusHistory so a rewrite (next turn /
+        // offline cache) doesn't drop them.
+        if !toolUses.isEmpty {
+            let entries = toolUses.map { t in
+                OWStatusEntry(action: t.action, query: t.query, results: t.results,
+                              sources: t.sources, description: t.title, done: true)
+            }
+            try c.encode(entries, forKey: .statusHistory)
+        }
     }
 }
 
@@ -203,15 +380,24 @@ public struct OWChatSummary: Decodable, Identifiable, Hashable, Sendable {
     public var createdAt: Double?
     public var pinned: Bool
     public var archived: Bool
+    /// True for chats that live only on this device (SwiftData), not on the
+    /// server. Never decoded from the API — set by the local store. The custom
+    /// decoder below leaves it at its `false` default for server chats.
+    public var isLocal: Bool = false
+    /// A matching excerpt, when this summary came from a full-text search
+    /// (the server's `/chats/search` snippet, or a local excerpt). Else nil.
+    public var snippet: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, title, updated_at, created_at, pinned, archived
+        case id, title, updated_at, created_at, pinned, archived, snippet
     }
 
     public init(id: String, title: String, updatedAt: Double? = nil,
-                createdAt: Double? = nil, pinned: Bool = false, archived: Bool = false) {
+                createdAt: Double? = nil, pinned: Bool = false, archived: Bool = false,
+                isLocal: Bool = false, snippet: String? = nil) {
         self.id = id; self.title = title; self.updatedAt = updatedAt
         self.createdAt = createdAt; self.pinned = pinned; self.archived = archived
+        self.isLocal = isLocal; self.snippet = snippet
     }
 
     public init(from decoder: Decoder) throws {
@@ -224,6 +410,7 @@ public struct OWChatSummary: Decodable, Identifiable, Hashable, Sendable {
         createdAt = try? c.decode(Double.self, forKey: .created_at)
         pinned = (try? c.decode(Bool.self, forKey: .pinned)) ?? false
         archived = (try? c.decode(Bool.self, forKey: .archived)) ?? false
+        snippet = (try? c.decodeIfPresent(String.self, forKey: .snippet))?.flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 
@@ -274,13 +461,43 @@ public struct OWChat: Decodable, Sendable, Identifiable {
     public var id: String
     public var title: String
     public var models: [String]
+    /// The active branch (currentId → root chain) — what the UI renders by default.
     public var messages: [OWMessage]
+    /// EVERY node in the branching history, not just the active branch. Needed to
+    /// preserve/navigate sibling branches (edit/regenerate) without clobbering them.
+    public var allMessages: [OWMessage]
+    /// The active leaf the server considers current.
+    public var currentId: String?
 
     enum Top: String, CodingKey { case id, title, chat }
     enum Inner: String, CodingKey { case id, title, models, messages, history }
 
     public init(id: String, title: String, models: [String] = [], messages: [OWMessage] = []) {
         self.id = id; self.title = title; self.models = models; self.messages = messages
+        self.allMessages = messages; self.currentId = messages.last?.id
+    }
+
+    /// Rebuilds a chat from a cached history tree (all nodes + the active leaf) —
+    /// used to restore a server chat for offline reading. Derives the active
+    /// branch (`messages`) by walking `currentId → root`.
+    public init(id: String, title: String, models: [String],
+                allMessages: [OWMessage], currentId: String?) {
+        self.id = id; self.title = title; self.models = models
+        self.allMessages = allMessages; self.currentId = currentId
+        self.messages = OWChat.activeBranch(allMessages, currentId: currentId)
+    }
+
+    /// The active branch (currentId → root, reversed) from a flat node list.
+    static func activeBranch(_ nodes: [OWMessage], currentId: String?) -> [OWMessage] {
+        let map = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        guard let cur = currentId, map[cur] != nil else {
+            return nodes.sorted { ($0.timestamp ?? 0) < ($1.timestamp ?? 0) }
+        }
+        var chain: [OWMessage] = []
+        var id: String? = cur
+        var guardN = 0
+        while let i = id, let m = map[i], guardN < 10_000 { chain.append(m); id = m.parentId; guardN += 1 }
+        return chain.reversed()
     }
 
     public init(from decoder: Decoder) throws {
@@ -297,12 +514,17 @@ public struct OWChat: Decodable, Sendable, Identifiable {
             // message must not drop the rest of the conversation.
             let flat = ((try? inner.decode([OWLossy<OWMessage>].self, forKey: .messages)) ?? [])
                 .compactMap(\.value)
-            let chain = (try? inner.decode(OWHistory.self, forKey: .history))?.ordered() ?? []
+            let history = try? inner.decode(OWHistory.self, forKey: .history)
+            let chain = history?.ordered() ?? []
             messages = chain.count > flat.count ? chain : flat
+            allMessages = history.map { Array($0.messages.values) } ?? messages
+            currentId = history?.currentId ?? messages.last?.id
         } else {
             title = topTitle ?? "Conversa"
             models = []
             messages = []
+            allMessages = []
+            currentId = nil
         }
     }
 }

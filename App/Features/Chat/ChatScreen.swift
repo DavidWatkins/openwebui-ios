@@ -21,9 +21,15 @@ struct ChatScreen: View {
     @State private var webURL = ""
     @State private var comingSoon: String?
     @State private var showVoice = false
+    @State private var showTools = false
+    /// Whether the user is at (or near) the end of the transcript. Streaming only
+    /// auto-scrolls while pinned, so scrolling up to re-read mid-reply sticks.
+    @State private var pinnedToBottom = true
+    /// Bumped on each send so `.sensoryFeedback` fires a light tap.
+    @State private var sendFeedback = 0
 
-    init(app: AppState, chat: OWChatSummary?, temporary: Bool = false, onChanged: @escaping () -> Void) {
-        let model = app.makeChatViewModel(chat: chat, temporary: temporary)
+    init(app: AppState, chat: OWChatSummary?, mode: ChatMode? = nil, onChanged: @escaping () -> Void) {
+        let model = app.makeChatViewModel(chat: chat, mode: mode)
         model.onChanged = onChanged
         _vm = StateObject(wrappedValue: model)
     }
@@ -36,13 +42,17 @@ struct ChatScreen: View {
                 composer
             }
         }
+        // Haptics: a light tap on send, a success tap when the reply finishes
+        // (true→false only — not when a stream starts). No-ops on macOS.
+        .sensoryFeedback(.impact(weight: .light), trigger: sendFeedback)
+        .sensoryFeedback(.success, trigger: vm.isStreaming) { old, new in old && !new }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     HStack(spacing: 6) {
-                        if vm.temporary {
-                            Image(systemName: "clock.badge.xmark")
+                        if vm.mode != .server {
+                            Image(systemName: vm.mode.symbol)
                                 .font(.ody(size: 11)).foregroundStyle(theme.accent)
                         }
                         Text(vm.title)
@@ -52,15 +62,44 @@ struct ChatScreen: View {
                     modelMenu
                 }
             }
+            // Mode picker (Claude-style ghost affordance, generalized to three
+            // modes): choose server / on-device / temporary while the chat is
+            // still empty. Locks once the conversation starts.
+            ToolbarItem(placement: .topBarTrailing) {
+                if vm.canChangeMode {
+                    Menu {
+                        Picker("Modo da conversa", selection: Binding(get: { vm.mode }, set: { vm.setMode($0) })) {
+                            ForEach(ChatMode.allCases, id: \.self) { m in
+                                Label(m.label, systemImage: m.symbol).tag(m)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: vm.mode.symbol)
+                            .foregroundStyle(vm.mode == .server ? theme.secondaryText : theme.accent)
+                    }
+                    .accessibilityLabel(Text("Modo da conversa"))
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button { showVoice = true } label: {
                     Image(systemName: "waveform").foregroundStyle(theme.accent)
                 }
+                .accessibilityLabel(Text("Conversa por voz"))
             }
         }
         .onAppear {
             vm.loadHistoryIfNeeded()
             voice.client = app.client
+            // "Take a Photo to Ask" App Intent → pop the camera on a fresh chat.
+            if vm.chatID == nil, AppLaunch.shared.openCameraOnNewChat {
+                AppLaunch.shared.openCameraOnNewChat = false
+                showCamera = true
+            }
+            // Share Extension → apply the shared URL / text / file to this new chat.
+            if vm.chatID == nil, let item = AppLaunch.shared.pendingShare {
+                AppLaunch.shared.pendingShare = nil
+                Task { await vm.applyShared(item) }
+            }
         }
         // Coming back from the background: re-fetch so messages/images created
         // meanwhile on the web UI show up (unless we're mid-stream).
@@ -70,7 +109,9 @@ struct ChatScreen: View {
             }
         }
         .fullScreenCover(isPresented: $showVoice) {
-            VoiceView(app: app, seed: VoiceSeed(chatID: vm.chatID, messages: vm.messages, model: vm.selectedModel))
+            VoiceView(app: app,
+                      seed: VoiceSeed(chatID: vm.chatID, messages: vm.messages, model: vm.selectedModel),
+                      onCommit: { vm.ingestVoiceTurns($0) })
                 .environment(\.theme, theme)
         }
     }
@@ -78,7 +119,10 @@ struct ChatScreen: View {
     private var modelMenu: some View {
         Menu {
             ForEach(app.models) { m in
-                Button { vm.selectModel(m.id) } label: {
+                Button {
+                    vm.selectModel(m.id)
+                    app.preferredModelID = m.id   // remember it as the default for new chats
+                } label: {
                     if vm.selectedModel == m.id {
                         Label(m.shortName, systemImage: "checkmark")
                     } else {
@@ -93,40 +137,131 @@ struct ChatScreen: View {
             }
             .foregroundStyle(theme.secondaryText)
         }
+        .accessibilityLabel(Text("Escolher modelo"))
+        .accessibilityValue(Text(verbatim: vm.selectedModelName))
     }
 
     // MARK: - Messages
 
     private var messages: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                if vm.isLoadingHistory && vm.messages.isEmpty {
-                    ProgressView().tint(theme.accent).padding(.top, 80)
-                } else if vm.messages.isEmpty {
-                    welcome.padding(.top, 60)
+        GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    if vm.isLoadingHistory && vm.messages.isEmpty {
+                        ProgressView().tint(theme.accent).padding(.top, 80)
+                    } else if vm.messages.isEmpty {
+                        welcome.padding(.top, 60)
+                    }
+                    LazyVStack(spacing: 16) {
+                        ForEach(Array(vm.messages.enumerated()), id: \.element.id) { idx, msg in
+                            let streaming = vm.isStreaming && idx == vm.messages.count - 1 && msg.role == .assistant
+                            daySeparator(idx)
+                            MessageBubble(
+                                message: msg,
+                                isStreaming: streaming,
+                                client: app.client,
+                                branch: vm.branchInfo(for: msg.id),
+                                models: app.models,
+                                // Tool activity ("🔧 web_search: …") shows inline under this
+                                // reply while it runs — only on the message being generated.
+                                toolStatus: streaming ? vm.toolStatus : nil,
+                                tokPerSec: msg.role == .assistant ? vm.genRate[msg.id] : nil,
+                                onEdit: msg.role == .user ? { vm.editUser(messageID: msg.id, newText: $0) } : nil,
+                                onRegenerate: msg.role == .assistant ? { vm.regenerate(messageID: msg.id) } : nil,
+                                onRetryModel: msg.role == .assistant ? { vm.regenerate(messageID: msg.id, model: $0) } : nil,
+                                onBranch: { vm.switchBranch(messageID: msg.id, delta: $0) }
+                            )
+                            .id(msg.id)
+                        }
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 16)
+                    // Bottom sentinel: its position inside the viewport tells us
+                    // whether the user is pinned to the end of the transcript.
+                    Color.clear.frame(height: 1).id("bottom")
+                        .background(GeometryReader { geo in
+                            Color.clear.preference(key: BottomEdgeKey.self,
+                                                   value: geo.frame(in: .named("chatScroll")).minY)
+                        })
                 }
-                LazyVStack(spacing: 16) {
-                    ForEach(Array(vm.messages.enumerated()), id: \.element.id) { idx, msg in
-                        MessageBubble(
-                            message: msg,
-                            isStreaming: vm.isStreaming && idx == vm.messages.count - 1 && msg.role == .assistant,
-                            client: app.client
-                        )
-                        .id(msg.id)
+                .coordinateSpace(name: "chatScroll")
+                .onPreferenceChange(BottomEdgeKey.self) { minY in
+                    let pinned = minY < viewport.size.height + 60
+                    if pinned != pinnedToBottom { pinnedToBottom = pinned }
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .refreshable { await vm.reloadHistory() }
+                // Per-token updates: follow the stream only while pinned, and
+                // without animation — animated per-token scrolls rubber-band.
+                .onChange(of: vm.messages.last?.content) { _, _ in
+                    if pinnedToBottom { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .onChange(of: vm.toolStatus) { _, _ in
+                    if pinnedToBottom { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                // A new message (send/regenerate/branch) is user-initiated —
+                // scroll gently and re-pin. Same when the keyboard opens.
+                .onChange(of: vm.messages.count) { _, _ in
+                    pinnedToBottom = true
+                    scrollToBottom(proxy)
+                }
+                .onChange(of: inputFocused) { _, focused in
+                    if focused {
+                        pinnedToBottom = true
+                        scrollToBottom(proxy)
                     }
                 }
-                .padding(.horizontal, 14).padding(.vertical, 16)
-                Color.clear.frame(height: 1).id("bottom")
+                // "Jump to latest" pill, shown only while scrolled up.
+                .overlay(alignment: .bottomTrailing) {
+                    if !pinnedToBottom {
+                        Button {
+                            pinnedToBottom = true
+                            scrollToBottom(proxy)
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.ody(size: 14, weight: .semibold))
+                                .foregroundStyle(theme.fg)
+                                .frame(width: 38, height: 38)
+                                .background(theme.panel, in: Capsule())
+                                .overlay(Capsule().stroke(theme.border, lineWidth: 1))
+                                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 14).padding(.bottom, 10)
+                        .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                        .accessibilityLabel(Text("Ir para o fim"))
+                    }
+                }
+                .animation(.easeInOut(duration: 0.15), value: pinnedToBottom)
             }
-            .scrollDismissesKeyboard(.interactively)
-            .refreshable { await vm.reloadHistory() }
-            .onChange(of: vm.messages.last?.content) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: vm.messages.count) { _, _ in scrollToBottom(proxy) }
         }
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
         withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+    }
+
+    /// A centered "Hoje / Ontem / date" pill, shown above a message when the
+    /// calendar day changes (and above the first message) — iMessage-style.
+    @ViewBuilder private func daySeparator(_ idx: Int) -> some View {
+        let cur = vm.messages[idx].timestamp
+        let prev = idx > 0 ? vm.messages[idx - 1].timestamp : nil
+        let newDay = prev == nil || (cur != nil && !Calendar.current.isDate(
+            Date(timeIntervalSince1970: cur!), inSameDayAs: Date(timeIntervalSince1970: prev!)))
+        if let cur, newDay {
+            Text(Self.dayLabel(cur))
+                .font(.ody(size: 11, design: .monospaced)).foregroundStyle(theme.secondaryText)
+                .padding(.horizontal, 12).padding(.vertical, 4)
+                .background(theme.panel, in: Capsule())
+                .frame(maxWidth: .infinity).padding(.vertical, 2)
+        }
+    }
+
+    private static func dayLabel(_ t: Double) -> String {
+        let d = Date(timeIntervalSince1970: t), cal = Calendar.current
+        if cal.isDateInToday(d) { return L("Hoje") }
+        if cal.isDateInYesterday(d) { return L("Ontem") }
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .none
+        return f.string(from: d)
     }
 
     private var welcome: some View {
@@ -148,17 +283,12 @@ struct ChatScreen: View {
         VStack(spacing: 8) {
             if vm.isStreaming { Divider().overlay(theme.border) }
             HStack(spacing: 8) {
-                toggleChip(system: "globe", label: "Buscar na web", on: $vm.webSearch)
+                featuresMenu
+                toggleChip(system: "photo.artframe", label: "Gerar imagem", on: $vm.imageMode)
                 Spacer()
             }
             .padding(.horizontal, 12)
-            if let err = vm.error ?? voice.error {
-                Text(err)
-                    .font(.ody(size: 11, design: .monospaced))
-                    .foregroundStyle(theme.accent)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-            }
+            if let err = vm.error ?? voice.error { errorBanner(err) }
             if !vm.pendingImageURLs.isEmpty || !vm.pendingDocuments.isEmpty || vm.uploading { pendingStrip }
             HStack(alignment: .bottom, spacing: 8) {
                 attachButton
@@ -167,6 +297,20 @@ struct ChatScreen: View {
                     .font(.ody(.body, design: .monospaced))
                     .foregroundStyle(theme.fg)
                     .focused($inputFocused)
+                    #if os(macOS)
+                    // Return sends (same guard as the send button); Shift-Return
+                    // and Option-Return (native) insert a line break instead.
+                    .onSubmit {
+                        guard !vm.isStreaming, canSend else { return }
+                        submitComposer()
+                        inputFocused = true   // keep typing without re-clicking
+                    }
+                    .onKeyPress(.return, phases: .down) { press in
+                        guard press.modifiers.contains(.shift) else { return .ignored }
+                        vm.input += "\n"
+                        return .handled
+                    }
+                    #endif
                     .lineLimit(1...6)
                     .padding(.horizontal, 14).padding(.vertical, 10)
                     .background(theme.panel, in: RoundedRectangle(cornerRadius: 18))
@@ -196,13 +340,17 @@ struct ChatScreen: View {
         #endif
         .sheet(isPresented: $showNotePicker) {
             NotePickerSheet(client: app.client) { note in Task { await vm.attachNote(note) } }
+                .macSheetFrame()
         }
         .sheet(isPresented: $showChatPicker) {
             ChatPickerSheet(client: app.client) { c in Task { await vm.attachChatReference(c) } }
+                .macSheetFrame()
         }
         .sheet(isPresented: $showKBPicker) {
             KBPickerSheet(client: app.client) { kb in vm.attachKnowledge(kb) }
+                .macSheetFrame()
         }
+        .sheet(isPresented: $showTools) { toolsSheet.macSheetFrame(440, 480) }
         .alert("Anexar Página Web", isPresented: $showWebInput) {
             TextField("https://…", text: $webURL)
                 .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
@@ -214,7 +362,32 @@ struct ChatScreen: View {
         } message: { Text(comingSoon ?? "") }
     }
 
-    private var inputPrompt: LocalizedStringKey { voice.isRecording ? "Ouvindo…" : "Mensagem…" }
+    /// Dismissible error banner: icon + message + ✕, in the semantic error red
+    /// (not the brand accent, which doesn't read as "something went wrong").
+    private func errorBanner(_ err: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").font(.ody(size: 12))
+            Text(err)
+                .font(.ody(size: 11, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button { vm.error = nil; voice.error = nil } label: {
+                Image(systemName: "xmark").font(.ody(size: 11, weight: .semibold))
+                    .frame(minWidth: 24, minHeight: 24).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text("Dispensar erro"))
+        }
+        .foregroundStyle(theme.danger)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.danger.opacity(0.35), lineWidth: 1))
+        .padding(.horizontal, 12)
+    }
+
+    private var inputPrompt: LocalizedStringKey {
+        if voice.isRecording { return "Ouvindo…" }
+        return vm.imageMode ? "Descreva a imagem…" : "Mensagem…"
+    }
     private var inputBinding: Binding<String> {
         voice.isRecording ? .constant(voice.partialText) : $vm.input
     }
@@ -232,13 +405,17 @@ struct ChatScreen: View {
             Button { showNotePicker = true } label: { Label("Anexar Notas", systemImage: "note.text") }
             Button { showKBPicker = true } label: { Label("Anexar Base de Conhecimento", systemImage: "cylinder.split.1x2") }
             Button { showChatPicker = true } label: { Label("Chats de Referência", systemImage: "clock.arrow.circlepath") }
-            Button { comingSoon = "Google Drive — em breve." } label: { Label("Google Drive", systemImage: "externaldrive") }
+            // Just the feature name (a brand, shown verbatim) — the localized
+            // alert title "Em breve" already means "coming soon", so we don't
+            // bake the pt-BR phrase into a String that Text() can't localize.
+            Button { comingSoon = "Google Drive" } label: { Label("Google Drive", systemImage: "externaldrive") }
         } label: {
             Image(systemName: "plus")
                 .font(.ody(size: 20))
                 .foregroundStyle(theme.accent)
                 .frame(width: 34, height: 42)
         }
+        .accessibilityLabel(Text("Anexar"))
     }
 
     private var pendingStrip: some View {
@@ -251,6 +428,7 @@ struct ChatScreen: View {
                             Image(systemName: "xmark.circle.fill")
                                 .foregroundStyle(.white, .black.opacity(0.5))
                         }
+                        .accessibilityLabel(Text("Remover anexo"))
                         .offset(x: 5, y: -5)
                     }
                 }
@@ -262,6 +440,7 @@ struct ChatScreen: View {
                         Button { vm.removePendingDocument(doc) } label: {
                             Image(systemName: "xmark.circle.fill").foregroundStyle(theme.secondaryText)
                         }
+                        .accessibilityLabel(Text("Remover anexo"))
                     }
                     .padding(.horizontal, 10).padding(.vertical, 8)
                     .frame(maxWidth: 180)
@@ -304,6 +483,7 @@ struct ChatScreen: View {
             .frame(width: 34, height: 42)
         }
         .disabled(voice.processing)
+        .accessibilityLabel(Text(voice.isRecording ? "Parar ditado" : "Ditar mensagem"))
     }
 
     private func toggleMic() async {
@@ -332,20 +512,97 @@ struct ChatScreen: View {
     private var sendButton: some View {
         Button {
             if voice.isRecording {
-                Task { appendTranscript(await stopVoiceCapturing()); inputFocused = false; if canSend { vm.send() } }
+                Task { appendTranscript(await stopVoiceCapturing()); inputFocused = false; if canSend { submitComposer() } }
             } else if vm.isStreaming {
                 vm.stop()
             } else {
-                vm.send(); inputFocused = false
+                submitComposer(); inputFocused = false
             }
         } label: {
+            let active = canSend || vm.isStreaming || voice.isRecording
             Image(systemName: vm.isStreaming ? "stop.fill" : "arrow.up")
                 .font(.ody(size: 18, weight: .bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(active ? theme.onAccent : theme.secondaryText)
                 .frame(width: 42, height: 42)
-                .background((canSend || vm.isStreaming || voice.isRecording) ? theme.accent : theme.border, in: Circle())
+                .background(active ? theme.accent : theme.border, in: Circle())
         }
+        .accessibilityLabel(Text(vm.isStreaming ? "Parar resposta" : "Enviar mensagem"))
+        #if os(macOS)
+        .keyboardShortcut(.return, modifiers: .command)   // ⌘↩ sends from anywhere
+        #endif
         .disabled(!voice.isRecording && !vm.isStreaming && !canSend)
+    }
+
+    /// Composer chip that opens the Tools sheet. Accented when any tool is on;
+    /// shows the count so you can see at a glance how many are active.
+    private var featuresMenu: some View {
+        let count = [vm.searchTool, vm.weatherTool, vm.codeInterpreter, vm.imageGeneration].filter { $0 }.count
+        return Button { showTools = true } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "wrench.and.screwdriver").font(.ody(size: 11))
+                Text("Ferramentas").font(.ody(size: 12, design: .monospaced))
+                if count > 0 { Text(verbatim: "\(count)").font(.ody(size: 11, design: .monospaced)) }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .foregroundStyle(count > 0 ? theme.onAccent : theme.secondaryText)
+            .background(count > 0 ? theme.accent : theme.panel, in: Capsule())
+            .overlay(Capsule().stroke(theme.border, lineWidth: count > 0 ? 0 : 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Ferramentas"))
+        .accessibilityHint(Text("Ativa ferramentas como busca na web e código"))
+    }
+
+    /// Claude-style tool picker: one labeled toggle row per tool, in a sheet.
+    /// Web search + weather run client-side (agent loop); code + illustrate are
+    /// server-backed. Each is independent.
+    private var toolsSheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Ferramentas").font(.ody(size: 17, design: .monospaced)).foregroundStyle(theme.fg)
+                Spacer()
+                Button { showTools = false } label: {
+                    Text("Concluir").font(.ody(size: 15, design: .monospaced)).foregroundStyle(theme.accent)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding()
+            Divider().overlay(theme.border)
+            ScrollView {
+                VStack(spacing: 10) {
+                    toolRow("globe", .blue, "Buscar na web",
+                            "Resultados da web ao vivo.", $vm.searchTool)
+                    toolRow("cloud.sun.fill", .orange, "Clima",
+                            "Condições atuais (Open-Meteo).", $vm.weatherTool)
+                    toolRow("chevron.left.forwardslash.chevron.right", .green, "Executar código",
+                            "Interpretador de código no servidor.", $vm.codeInterpreter)
+                    toolRow("photo", .purple, "Ilustrar resposta",
+                            "Gera uma imagem a partir da resposta.", $vm.imageGeneration)
+                    Divider().overlay(theme.border).padding(.vertical, 2)
+                    toolRow("brain", .pink, "Pensar",
+                            "Deixe o modelo raciocinar antes de responder.", $vm.thinkingEnabled)
+                }
+                .padding()
+            }
+        }
+        .background(theme.bg)
+        .presentationDetents([.medium, .large])
+    }
+
+    private func toolRow(_ icon: String, _ tint: Color, _ title: LocalizedStringKey,
+                         _ subtitle: LocalizedStringKey, _ on: Binding<Bool>) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon).font(.system(size: 16)).foregroundStyle(tint).frame(width: 26)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.ody(size: 15, design: .monospaced)).foregroundStyle(theme.fg)
+                Text(subtitle).font(.ody(size: 11)).foregroundStyle(theme.secondaryText)
+            }
+            Spacer()
+            Toggle("", isOn: on).labelsHidden().tint(theme.accent)
+        }
+        .padding(12)
+        .background(theme.panel, in: RoundedRectangle(cornerRadius: 14))
+        .sensoryFeedback(.selection, trigger: on.wrappedValue)
     }
 
     private func toggleChip(system: String, label: String, on: Binding<Bool>) -> some View {
@@ -355,16 +612,33 @@ struct ChatScreen: View {
                 Text(LocalizedStringKey(label)).font(.ody(size: 12, design: .monospaced))
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
-            .foregroundStyle(on.wrappedValue ? .white : theme.secondaryText)
+            .foregroundStyle(on.wrappedValue ? theme.onAccent : theme.secondaryText)
             .background(on.wrappedValue ? theme.accent : theme.panel, in: Capsule())
             .overlay(Capsule().stroke(theme.border, lineWidth: on.wrappedValue ? 0 : 1))
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(on.wrappedValue ? .isSelected : [])
+        .sensoryFeedback(.selection, trigger: on.wrappedValue)
     }
 
     private var canSend: Bool {
-        (!vm.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !vm.pendingImageURLs.isEmpty || !vm.pendingDocuments.isEmpty)
+        let hasText = !vm.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Image generation uses the server's default image engine — no LLM needed.
+        if vm.imageMode { return hasText }
+        return (hasText || !vm.pendingImageURLs.isEmpty || !vm.pendingDocuments.isEmpty)
             && vm.selectedModel != nil
     }
+
+    /// Route the composer's send action: image generation or a chat turn.
+    private func submitComposer() {
+        sendFeedback += 1
+        if vm.imageMode { vm.generateImage() } else { vm.send() }
+    }
+}
+
+/// Where the bottom sentinel sits inside the scroll viewport (its minY in the
+/// "chatScroll" coordinate space) — drives the pinned-to-bottom detection.
+private struct BottomEdgeKey: PreferenceKey {
+    static var defaultValue: CGFloat = .infinity
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

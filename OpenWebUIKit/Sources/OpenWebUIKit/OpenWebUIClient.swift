@@ -11,6 +11,9 @@ public final class OpenWebUIClient: @unchecked Sendable {
     public let session: URLSession
     /// Session for long transfers (SSE streams, generation, uploads) — no 30s resource cap.
     public let longSession: URLSession
+    /// Shared real-time socket for true token streaming (server chats). Lazily
+    /// connected on first use; see `OWSocketStream.swift`.
+    var socket: OWSocket?
 
     public init(config: OWConfig = .default, tokens: OWKeychainStore = OWKeychainStore()) {
         self.config = config
@@ -187,6 +190,16 @@ public final class OpenWebUIClient: @unchecked Sendable {
     /// GET /api/v1/chats/pinned — the user's pinned chats (kept out of the main list).
     public func pinnedChats() async throws -> [OWChatSummary] {
         let data = try await send(request("/api/v1/chats/pinned"))
+        return decodeList(OWChatSummary.self, data)
+    }
+
+    /// GET /api/v1/chats/search?text= — server-side full-text search across all the
+    /// user's chats (title + message content). Each result carries a `snippet`.
+    public func searchChats(_ text: String) async throws -> [OWChatSummary] {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+?#")
+        let q = text.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+        let data = try await send(request("/api/v1/chats/search?text=\(q)"))
         return decodeList(OWChatSummary.self, data)
     }
 

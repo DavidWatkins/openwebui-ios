@@ -127,7 +127,7 @@ struct NotesView: View {
                 Label("Nova nota", systemImage: "square.and.pencil")
                     .font(.ody(.subheadline, design: .monospaced))
                     .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(theme.accent, in: Capsule()).foregroundStyle(.white)
+                    .background(theme.accent, in: Capsule()).foregroundStyle(theme.onAccent)
             }
         }
     }

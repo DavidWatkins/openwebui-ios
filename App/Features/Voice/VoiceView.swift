@@ -17,18 +17,21 @@ struct VoiceSeed: Identifiable {
 struct VoiceView: View {
     let app: AppState
     let seed: VoiceSeed?
+    /// Hands completed voice turns back to the host chat (shared thread + context).
+    let onCommit: (([OWMessage]) -> Void)?
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     @StateObject private var convo: VoiceConversation
     @ObservedObject private var speech = SpeechManager.shared
-    @State private var pulse = false
 
-    init(app: AppState, seed: VoiceSeed? = nil) {
+    init(app: AppState, seed: VoiceSeed? = nil, onCommit: (([OWMessage]) -> Void)? = nil) {
         self.app = app
         self.seed = seed
+        self.onCommit = onCommit
         _convo = StateObject(wrappedValue: VoiceConversation(client: app.client,
                                                              completions: app.completions,
-                                                             models: app.models))
+                                                             models: app.models,
+                                                             defaultModel: app.defaultModel))
     }
 
     var body: some View {
@@ -37,12 +40,8 @@ struct VoiceView: View {
                 theme.bg.ignoresSafeArea()
                 if theme.backdrop { ThemeBackdrop(theme: theme) }
                 VStack(spacing: 0) {
-                    transcript
-                    Spacer(minLength: 8)
-                    orb
-                    statusLine
-                    Spacer(minLength: 8)
-                    controlButton
+                    transcript                 // fills — live text stays visible
+                    bottomDock                 // spectrum + state + controls
                 }
                 .padding(16)
             }
@@ -50,9 +49,9 @@ struct VoiceView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    if seed != nil {
-                        Button("Fechar") { convo.stop(); dismiss() }.foregroundStyle(theme.accent)
-                    } else if !convo.turns.isEmpty {
+                    // No "Close" here — the ✕ control at the bottom exits. Keep only
+                    // the new-conversation button for the standalone Voz screen.
+                    if seed == nil, !convo.turns.isEmpty {
                         Button { convo.reset() } label: { Image(systemName: "square.and.pencil") }
                     }
                 }
@@ -63,13 +62,14 @@ struct VoiceView: View {
             }
         }
         .tint(theme.accent)
-        .onChange(of: convo.phase) { _, p in
-            pulse = (p == .listening || p == .speaking)
-        }
         .onAppear {
             if speech.useServer { Task { await speech.loadServerVoices() } }
+            convo.onCommit = onCommit   // route turns into the host chat
+            convo.contextProvider = { app.contextSystemMessage() }   // date/time, location, instructions
             if let seed { convo.seedOnce(chatID: seed.chatID, messages: seed.messages, model: seed.model) }
-            else if !convo.active { convo.reset() }   // Voz tab → always a new conversation
+            else if !convo.active { convo.reset() }
+            // Auto-start listening on open, ChatGPT-style — no manual "Iniciar".
+            if !convo.active { Task { await convo.startSession() } }
         }
     }
 
@@ -82,7 +82,7 @@ struct VoiceView: View {
             } label: {
                 HStack(spacing: 3) {
                     Image(systemName: "person.wave.2").font(.system(size: 9))
-                    Text(speech.serverVoices.first { $0.id == convo.ttsVoice }?.name ?? "Voz")
+                    Text(speech.serverVoices.first { $0.id == convo.ttsVoice }?.name ?? L("Voz"))
                         .font(.ody(size: 11, design: .monospaced)).lineLimit(1)
                 }.foregroundStyle(theme.accent)
             }
@@ -106,8 +106,10 @@ struct VoiceView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 4)
             }
-            .onChange(of: convo.turns.count) { _, _ in withAnimation { proxy.scrollTo("bottom") } }
-            .onChange(of: convo.reply) { _, _ in proxy.scrollTo("bottom") }
+            .onChange(of: convo.turns.count) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            .onChange(of: convo.reply) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
+            // Keep your live transcription in view above the dock as you speak.
+            .onChange(of: convo.liveText) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
         }
     }
 
@@ -126,43 +128,20 @@ struct VoiceView: View {
         }
     }
 
-    // MARK: - Orb
+    // MARK: - Bottom dock (status + spectrum + controls)
 
-    private var orb: some View {
-        ZStack {
-            Circle()
-                .fill(theme.accent.opacity(0.18))
-                .frame(width: 190, height: 190)
-                .scaleEffect(pulse ? 1.12 : 0.9)
-                .animation(pulse ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
-                                 : .easeOut(duration: 0.3), value: pulse)
-            Circle()
-                .fill(theme.accent.opacity(0.30))
-                .frame(width: 140, height: 140)
-            Circle()
-                .fill(theme.accent)
-                .frame(width: 104, height: 104)
-            Group {
-                switch convo.phase {
-                case .thinking:
-                    ProgressView().tint(theme.bg).controlSize(.large)
-                default:
-                    Image(systemName: orbIcon).font(.system(size: 40, weight: .semibold))
-                        .foregroundStyle(theme.bg)
-                        .symbolEffect(.variableColor.iterative, isActive: convo.phase == .speaking)
-                }
-            }
+    /// The whole voice affordance lives at the bottom: a status line, a theme-color
+    /// FFT spectrum that reacts while listening (and shimmers while responding), and
+    /// the mute / exit controls. The transcript owns the rest of the screen.
+    private var bottomDock: some View {
+        VStack(spacing: 12) {
+            statusLine
+            SpectrumVisualizer(source: convo.spectrumSource, phase: convo.phase, color: theme.accent)
+                .frame(height: 56)
+                .onTapGesture { convo.tapOrb() }
+            controlButton
         }
-        .contentShape(Circle())
-        .onTapGesture { convo.tapOrb() }
-    }
-
-    private var orbIcon: String {
-        switch convo.phase {
-        case .listening: return "waveform"
-        case .speaking:  return "speaker.wave.3.fill"
-        default:         return "mic.fill"
-        }
+        .padding(.top, 8)
     }
 
     private var statusLine: some View {
@@ -185,20 +164,35 @@ struct VoiceView: View {
 
     // MARK: - Controls
 
+    /// ChatGPT-style bottom controls: mute (left), exit (right). The session
+    /// auto-starts, so there's no explicit "start" — tapping mute or the orb
+    /// manages the mic; exit ends it. If nothing's running, mute doubles as start.
     private var controlButton: some View {
-        Button { convo.toggleSession() } label: {
-            HStack(spacing: 8) {
-                Image(systemName: convo.active ? "stop.fill" : "mic.fill")
-                Text(LocalizedStringKey(convo.active ? "Encerrar" : "Iniciar conversa"))
-                    .font(.ody(.headline, design: .monospaced))
+        HStack {
+            circleControl(convo.muted ? "mic.slash.fill" : "mic.fill",
+                          on: convo.muted) {
+                if !convo.active { Task { await convo.startSession() } }
+                else { convo.toggleMute() }
             }
-            .frame(maxWidth: .infinity).padding(.vertical, 15)
-            .background(convo.active ? theme.panel : theme.accent,
-                        in: RoundedRectangle(cornerRadius: 14))
-            .foregroundStyle(convo.active ? theme.accent : .white)
-            .overlay(RoundedRectangle(cornerRadius: 14)
-                .stroke(convo.active ? theme.accent : .clear, lineWidth: 1))
+            Spacer()
+            circleControl("xmark", on: false) {
+                convo.stop()
+                dismiss()
+            }
         }
+        .padding(.horizontal, 24)
+    }
+
+    private func circleControl(_ system: String, on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: system)
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(on ? .white : theme.fg)
+                .frame(width: 60, height: 60)
+                .background(on ? theme.accent : theme.panel, in: Circle())
+                .overlay(Circle().stroke(theme.border.opacity(0.5), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
 
     private var modelPicker: some View {
@@ -206,11 +200,69 @@ struct VoiceView: View {
             ForEach(convo.models) { m in Button(m.shortName) { convo.model = m.id } }
         } label: {
             HStack(spacing: 3) {
-                Text(convo.models.first { $0.id == convo.model }?.shortName ?? "Modelo")
+                Text(convo.models.first { $0.id == convo.model }?.shortName ?? L("Modelo"))
                     .font(.ody(size: 11, design: .monospaced)).lineLimit(1)
                 Image(systemName: "chevron.up.chevron.down").font(.system(size: 8))
             }
             .foregroundStyle(theme.accent).frame(maxWidth: 140, alignment: .trailing)
+        }
+    }
+}
+
+/// Holds the latest FFT bands and eases them toward the target every frame. It's
+/// a plain reference (not @Published) so the audio spectrum — which arrives only a
+/// few times per second — doesn't re-render the whole voice screen and fight the
+/// 60fps animation (that was the stutter). The Canvas reads it each frame.
+final class SpectrumSource {
+    private var target = [Float](repeating: 0, count: VoiceInputManager.bandCount)
+    private(set) var display = [Float](repeating: 0, count: VoiceInputManager.bandCount)
+    func set(_ b: [Float]) { if b.count == target.count { target = b } }
+    func clear() { for i in target.indices { target[i] = 0 } }
+    /// Ease toward the target; call once per rendered frame.
+    func tick() { for i in display.indices { display[i] += (target[i] - display[i]) * 0.35 } }
+}
+
+/// A horizontal FFT spectrum bar (center-mirrored) in the theme color. While
+/// LISTENING it renders the live FFT bands; while THINKING/SPEAKING it shows an
+/// animated shimmer to signal activity (the mic is idle then); otherwise a faint
+/// baseline. Redraws every frame via TimelineView.
+struct SpectrumVisualizer: View {
+    var source: SpectrumSource
+    var phase: VoiceConversation.Phase
+    var color: Color
+
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            Canvas { ctx, size in
+                source.tick()                 // ease bars toward the latest FFT
+                let bands = source.display
+                let n = 28
+                let slot = size.width / CGFloat(n)
+                let barW = slot * 0.6
+                let midY = size.height / 2
+                for i in 0..<n {
+                    let frac = Double(i) / Double(n)
+                    var h: CGFloat
+                    switch phase {
+                    case .listening:
+                        h = CGFloat(i < bands.count ? bands[i] : 0)
+                    case .speaking, .thinking:
+                        // No mic input while responding → animated shimmer instead.
+                        let s = (sin(t * 4 + frac * 9) + sin(t * 2.7 + frac * 15)) / 2   // -1…1
+                        h = 0.16 + 0.34 * CGFloat((s + 1) / 2)
+                    default:
+                        h = 0.03
+                    }
+                    let barH = max(3, h * size.height)
+                    let x = CGFloat(i) * slot + (slot - barW) / 2
+                    let rect = CGRect(x: x, y: midY - barH / 2, width: barW, height: barH)
+                    // Center bars a touch brighter for a nice equalizer falloff.
+                    let bright = 0.55 + 0.45 * (1 - abs(frac - 0.5) * 2)
+                    ctx.fill(Path(roundedRect: rect, cornerRadius: barW / 2),
+                             with: .color(color.opacity(0.35 + 0.5 * bright)))
+                }
+            }
         }
     }
 }

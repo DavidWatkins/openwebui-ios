@@ -1,25 +1,14 @@
 import SwiftUI
 import OpenWebUIKit
 
-/// Main tabbed shell once logged in: Conversas + Notas. (Workspace tab next.)
+/// Single-surface shell once logged in: the chat list is the app. Voice launches
+/// from inside a chat; image generation is a chat mode; Notes and Workspace live
+/// behind the menu in the chat list's toolbar. (Formerly a 5-tab TabView.)
 struct MainView: View {
     let app: AppState
-    @Environment(\.theme) private var theme
 
     var body: some View {
-        TabView {
-            ChatListView(app: app)
-                .tabItem { Label("Conversas", systemImage: "bubble.left.and.bubble.right") }
-            NotesView(app: app)
-                .tabItem { Label("Notas", systemImage: "note.text") }
-            ImageGenView(app: app)
-                .tabItem { Label("Imagem", systemImage: "photo.artframe") }
-            VoiceView(app: app)
-                .tabItem { Label("Voz", systemImage: "waveform") }
-            WorkspaceView(app: app)
-                .tabItem { Label("Workspace", systemImage: "square.grid.2x2") }
-        }
-        .tint(theme.accent)
+        ChatListView(app: app)
     }
 }
 
@@ -30,11 +19,23 @@ struct ChatListView: View {
     @Environment(\.theme) private var theme
     @StateObject private var store: ChatStore
     @State private var path: [ChatRoute] = []
+    @ObservedObject private var launch = AppLaunch.shared
     @State private var showSettings = false
+    @State private var showNotes = false
+    @State private var showWorkspace = false
+    @State private var showArchived = false
+    @State private var showImages = false
     @State private var search = ""
+    @State private var searchTask: Task<Void, Never>?
+    /// Open a fresh chat on first launch (Claude-style), once per session.
+    @State private var didAutoOpen = false
     @State private var renaming: OWChatSummary?
     @State private var renameText = ""
     @State private var shareItem: ShareableURL?
+    #if os(macOS)
+    /// Split-view selection (macOS): the chat the detail pane shows.
+    @State private var selection: ChatRoute?
+    #endif
 
     init(app: AppState) {
         self.app = app
@@ -43,53 +44,41 @@ struct ChatListView: View {
 
     enum ChatRoute: Hashable {
         case existing(OWChatSummary)
-        case new(temporary: Bool)
+        /// `token` keeps repeated "new chat" opens distinct (fresh detail on macOS,
+        /// distinct path elements on iOS).
+        case new(mode: ChatMode, token: UUID)
     }
 
     private var filtered: [OWChatSummary] {
-        guard !search.isEmpty else { return store.chats }
-        return store.chats.filter { $0.title.localizedCaseInsensitiveContains(search) }
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return store.chats }
+        // Instant title matches over the loaded list, plus full-text results
+        // (server + cached bodies) from `store.search`, deduped.
+        let titleMatches = store.chats.filter { $0.title.localizedCaseInsensitiveContains(q) }
+        let ids = Set(titleMatches.map(\.id))
+        return titleMatches + store.searchResults.filter { !ids.contains($0.id) }
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            ZStack {
-                theme.bg.ignoresSafeArea()
-                content
-            }
-            .navigationTitle("Open WebUI")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button { path.append(.new(temporary: false)) } label: {
-                            Label("Nova conversa", systemImage: "square.and.pencil")
-                        }
-                        Button { path.append(.new(temporary: true)) } label: {
-                            Label("Conversa temporária", systemImage: "clock.badge.xmark")
-                        }
-                    } label: {
-                        Image(systemName: "square.and.pencil")
-                    }
-                }
-            }
-            .navigationDestination(for: ChatRoute.self) { route in
-                switch route {
-                case .existing(let c):
-                    ChatScreen(app: app, chat: c, onChanged: { Task { await store.load() } })
-                case .new(let temp):
-                    ChatScreen(app: app, chat: nil, temporary: temp, onChanged: { Task { await store.load() } })
-                }
-            }
-            .task { await store.load() }
-            .refreshable { await store.load() }
-        }
+        shell
         .tint(theme.accent)
+        // New-chat / camera App Intents (Action Button, Siri, Shortcuts) route here.
+        .onChange(of: launch.action) { _, _ in routeLaunch() }
+        .onAppear { routeLaunch() }
         .sheet(isPresented: $showSettings) {
-            SettingsView().environmentObject(app).environmentObject(themes)
+            SettingsView().environmentObject(app).environmentObject(themes).macSheetFrame()
+        }
+        .sheet(isPresented: $showNotes) {
+            NotesView(app: app).environment(\.theme, theme).macSheetFrame()
+        }
+        .sheet(isPresented: $showWorkspace) {
+            WorkspaceView(app: app).environment(\.theme, theme).macSheetFrame()
+        }
+        .sheet(isPresented: $showImages) {
+            ImageGenView(app: app).environment(\.theme, theme).macSheetFrame()
+        }
+        .sheet(isPresented: $showArchived) {
+            ArchivedChatsView(app: app).environment(\.theme, theme).macSheetFrame()
         }
         .sheet(item: $shareItem) { item in ShareSheet(items: [item.url]) }
         .alert("Renomear conversa", isPresented: Binding(
@@ -105,6 +94,117 @@ struct ChatListView: View {
         }
     }
 
+    /// Navigation shell: full-window push on iOS (unchanged), sidebar + detail
+    /// split view on macOS (Mail/Messages idiom — the list stays in view).
+    @ViewBuilder private var shell: some View {
+        #if os(macOS)
+        NavigationSplitView {
+            listPane
+                .navigationSplitViewColumnWidth(min: 240, ideal: 300)
+        } detail: {
+            if let route = selection {
+                chatDetail(route)
+                    .id(route)   // new route → fresh ChatScreen (its view model is per-chat)
+            } else {
+                emptyDetail
+            }
+        }
+        #else
+        NavigationStack(path: $path) {
+            listPane
+                .navigationDestination(for: ChatRoute.self) { route in chatDetail(route) }
+        }
+        // Returning to the list (pop to root) reloads it. `.task` only runs once,
+        // so a chat created while you were inside it — e.g. a brand-new chat, which
+        // isn't listed until its first reply — wouldn't otherwise appear on the way back.
+        .onChange(of: path) { _, newPath in
+            if newPath.isEmpty { Task { await store.load() } }
+        }
+        #endif
+    }
+
+    /// The chat list + its toolbar — the split view's sidebar on macOS, the
+    /// NavigationStack root on iOS.
+    private var listPane: some View {
+        ZStack {
+            theme.bg.ignoresSafeArea()
+            content
+        }
+        .navigationTitle("Open WebUI")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                // Secondary destinations tuck behind one menu so the chat list
+                // stays the single top-level surface (no more tab bar).
+                Menu {
+                    Button { showSettings = true } label: { Label("Ajustes", systemImage: "gearshape") }
+                    Divider()
+                    Button { showNotes = true } label: { Label("Notas", systemImage: "note.text") }
+                    Button { showImages = true } label: { Label("Imagem", systemImage: "photo.artframe") }
+                    Button { showWorkspace = true } label: { Label("Workspace", systemImage: "square.grid.2x2") }
+                    Button { showArchived = true } label: { Label("Arquivadas", systemImage: "archivebox") }
+                } label: {
+                    Image(systemName: "line.3.horizontal")
+                }
+                .accessibilityLabel(Text("Menu"))
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                // Opens a new chat in the user's default mode; the mode can be
+                // changed inside the chat (server / on-device / temporary).
+                Button { openRoute(.new(mode: app.preferredChatMode, token: UUID())) } label: {
+                    Image(systemName: "square.and.pencil")
+                }
+                .accessibilityLabel(Text("Nova conversa"))
+            }
+        }
+        .task { await store.load() }
+        .refreshable { await store.load() }
+        .onAppear {
+            // Boot straight into a new chat (Claude iOS style); the list is one
+            // back-swipe away (iOS) / stays put in the sidebar (macOS). Once per
+            // session so returning here doesn't re-open.
+            // Skip when a launch intent is pending — `routeLaunch()` opens that chat
+            // instead, and this would stack a second empty one on top of it.
+            if !didAutoOpen, launch.action == nil {
+                didAutoOpen = true
+                openRoute(.new(mode: app.preferredChatMode, token: UUID()))
+            }
+        }
+    }
+
+    @ViewBuilder private func chatDetail(_ route: ChatRoute) -> some View {
+        switch route {
+        case .existing(let c):
+            ChatScreen(app: app, chat: c, onChanged: { Task { await store.load() } })
+        case .new(let mode, _):
+            ChatScreen(app: app, chat: nil, mode: mode, onChanged: { Task { await store.load() } })
+        }
+    }
+
+    /// Open a chat: push on iOS, select into the detail pane on macOS.
+    private func openRoute(_ route: ChatRoute) {
+        #if os(macOS)
+        selection = route
+        #else
+        path.append(route)
+        #endif
+    }
+
+    #if os(macOS)
+    /// Detail-pane placeholder while no chat is selected.
+    private var emptyDetail: some View {
+        ZStack {
+            theme.bg.ignoresSafeArea()
+            VStack(spacing: 14) {
+                BrandMark(size: 56)
+                Text("Selecione uma conversa")
+                    .font(.ody(.headline, design: .monospaced))
+                    .foregroundStyle(theme.secondaryText)
+            }
+        }
+    }
+    #endif
+
     @ViewBuilder private var content: some View {
         if store.chats.isEmpty && store.loading {
             ProgressView().tint(theme.accent)
@@ -118,7 +218,7 @@ struct ChatListView: View {
     private var list: some View {
         List {
             ForEach(filtered) { chat in
-                Button { path.append(.existing(chat)) } label: { row(chat) }
+                Button { openRoute(.existing(chat)) } label: { row(chat) }
                     .buttonStyle(.plain)
                     .listRowBackground(theme.bg)
                     .swipeActions(edge: .trailing) {
@@ -137,21 +237,52 @@ struct ChatListView: View {
                     .contextMenu { chatActions(chat) }
             }
             if let err = store.error {
-                Text(err).font(.ody(.footnote, design: .monospaced))
-                    .foregroundStyle(theme.accent).listRowBackground(theme.bg)
+                // Dismissible banner in the semantic error red, not the accent.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").font(.ody(size: 12))
+                    Text(err).font(.ody(.footnote, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button { store.error = nil } label: {
+                        Image(systemName: "xmark").font(.ody(size: 11, weight: .semibold))
+                            .frame(minWidth: 24, minHeight: 24).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text("Dispensar erro"))
+                }
+                .foregroundStyle(theme.danger)
+                .padding(.vertical, 6)
+                .listRowBackground(theme.bg)
             }
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .searchable(text: $search, prompt: "Buscar conversas")
+        .onChange(of: search) { _, q in
+            // Debounce: full-text search fires ~300ms after the last keystroke.
+            searchTask?.cancel()
+            let query = q
+            searchTask = Task {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if Task.isCancelled { return }
+                await store.search(query)
+            }
+        }
     }
 
     private func row(_ chat: OWChatSummary) -> some View {
         HStack(spacing: 10) {
             if chat.pinned { Image(systemName: "pin.fill").font(.caption2).foregroundStyle(theme.accent) }
+            // On-device-only chats are badged so they're distinguishable from
+            // server chats in the same list.
+            if chat.isLocal { Image(systemName: "iphone").font(.caption2).foregroundStyle(theme.accent) }
             VStack(alignment: .leading, spacing: 2) {
                 Text(chat.title).font(.ody(.subheadline, design: .monospaced))
                     .foregroundStyle(theme.fg).lineLimit(1)
+                // A search match excerpt, when this row came from full-text search.
+                if let snippet = chat.snippet, !snippet.isEmpty {
+                    Text(snippet).font(.ody(size: 10, design: .monospaced))
+                        .foregroundStyle(theme.secondaryText).lineLimit(1)
+                }
                 if let ts = chat.updatedAt {
                     Text(RelativeDate.string(ts))
                         .font(.ody(size: 10, design: .monospaced)).foregroundStyle(theme.secondaryText)
@@ -192,16 +323,25 @@ struct ChatListView: View {
         renaming = chat
     }
 
+    /// New-chat / camera App Intents open a fresh chat here. (Voice is handled by
+    /// RootView.) The camera intent leaves `openCameraOnNewChat` set for ChatScreen.
+    private func routeLaunch() {
+        guard let a = launch.action, a == .newChat || a == .camera || a == .share else { return }
+        openRoute(.new(mode: app.preferredChatMode, token: UUID()))
+        didAutoOpen = true   // this IS the boot chat → don't let the list auto-open a 2nd
+        launch.consume()     // openCameraOnNewChat / pendingShare stay for ChatScreen
+    }
+
     private var emptyState: some View {
         VStack(spacing: 14) {
             BrandMark(size: 56)
             Text("Nenhuma conversa ainda")
                 .font(.ody(.headline, design: .monospaced)).foregroundStyle(theme.fg)
-            Button { path.append(.new(temporary: false)) } label: {
+            Button { openRoute(.new(mode: app.preferredChatMode, token: UUID())) } label: {
                 Label("Nova conversa", systemImage: "square.and.pencil")
                     .font(.ody(.subheadline, design: .monospaced))
                     .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(theme.accent, in: Capsule()).foregroundStyle(.white)
+                    .background(theme.accent, in: Capsule()).foregroundStyle(theme.onAccent)
             }
         }
     }
@@ -246,15 +386,98 @@ struct ShareSheet: View {
 }
 #endif
 
-/// Shared pt-BR relative-time formatter.
+/// Relative-time formatter that follows the app's selected UI language, not a
+/// fixed locale — otherwise "3 sem"/"agora" leak Portuguese into every other
+/// language. The locale is re-read on each call so a runtime language switch
+/// (LanguageManager) takes effect without an app relaunch.
 enum RelativeDate {
     private static let fmt: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
-        f.locale = Locale(identifier: "pt_BR")
         f.unitsStyle = .abbreviated
         return f
     }()
     static func string(_ epochSeconds: Double) -> String {
-        fmt.localizedString(for: Date(timeIntervalSince1970: epochSeconds), relativeTo: Date())
+        fmt.locale = LanguageManager.shared.locale
+        return fmt.localizedString(for: Date(timeIntervalSince1970: epochSeconds), relativeTo: Date())
+    }
+}
+
+/// Browse archived chats like normal conversations — tap to open and read the
+/// full thread, or swipe to restore (OWUI's archive is a toggle) / delete.
+/// Presented as a sheet from the main menu, next to Notes / Image / Workspace.
+struct ArchivedChatsView: View {
+    let app: AppState
+    @Environment(\.theme) private var theme
+    @Environment(\.dismiss) private var dismiss
+    @State private var chats: [OWChatSummary] = []
+    @State private var loading = true
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short; return f
+    }()
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                theme.bg.ignoresSafeArea()
+                if loading {
+                    ProgressView().tint(theme.accent)
+                } else if chats.isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "archivebox").font(.system(size: 40)).foregroundStyle(theme.secondaryText)
+                        Text("Nenhuma conversa arquivada.")
+                            .font(.ody(.subheadline, design: .monospaced)).foregroundStyle(theme.secondaryText)
+                    }
+                } else {
+                    List {
+                        ForEach(chats) { c in
+                            NavigationLink {
+                                ChatScreen(app: app, chat: c, onChanged: {}).environment(\.theme, theme)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(c.title.isEmpty ? L("Sem título") : c.title)
+                                        .font(.ody(.body, design: .monospaced)).foregroundStyle(theme.fg).lineLimit(1)
+                                    if let t = c.updatedAt ?? c.createdAt {
+                                        Text(Self.dateFormatter.string(from: Date(timeIntervalSince1970: t)))
+                                            .font(.ody(.caption, design: .monospaced)).foregroundStyle(theme.secondaryText)
+                                    }
+                                }
+                            }
+                            .listRowBackground(theme.panel)
+                            .swipeActions {
+                                Button(role: .destructive) { remove(c, delete: true) } label: {
+                                    Label("Apagar", systemImage: "trash")
+                                }
+                                Button { remove(c, delete: false) } label: {
+                                    Label("Restaurar", systemImage: "tray.and.arrow.up")
+                                }.tint(theme.accent)
+                            }
+                        }
+                    }
+                    .listStyle(.plain).scrollContentBackground(.hidden)
+                }
+            }
+            .navigationTitle("Arquivadas")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Concluir") { dismiss() }.foregroundStyle(theme.accent)
+                }
+            }
+            .task {
+                loading = true
+                chats = (try? await app.client.archivedChats()) ?? []
+                loading = false
+            }
+        }
+    }
+
+    /// Restore (unarchive, via the toggle endpoint) or delete, then drop the row.
+    private func remove(_ c: OWChatSummary, delete: Bool) {
+        chats.removeAll { $0.id == c.id }
+        Task {
+            if delete { try? await app.client.deleteChat(c.id) }
+            else { try? await app.client.archiveChat(c.id) }
+        }
     }
 }

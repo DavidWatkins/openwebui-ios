@@ -27,6 +27,8 @@ final class SpeechManager: NSObject, ObservableObject {
     var client: OpenWebUIClient?
     /// Voices advertised by the server's TTS engine (loaded on demand).
     @Published var serverVoices: [OWVoice] = []
+    /// The server's configured STT/TTS engines (admin config; nil if unavailable).
+    @Published var serverAudioConfig: OWAudioConfig?
     /// Per-conversation server voice; when set, overrides the global Settings voice.
     var voiceOverride: String?
     /// When true (hands-free voice mode), TTS uses a play-AND-record session so the
@@ -53,13 +55,32 @@ final class SpeechManager: NSObject, ObservableObject {
     func applyProximityRoute() {
         #if os(iOS)
         guard duplexSession else { return }
+        let session = AVAudioSession.sharedInstance()
+        // Never force the built-in speaker when an external output is connected —
+        // headphones/Bluetooth/CarPlay must win over the proximity heuristic.
+        let external: Set<AVAudioSession.Port> = [
+            .headphones, .bluetoothA2DP, .bluetoothLE, .bluetoothHFP,
+            .usbAudio, .carAudio, .airPlay, .lineOut, .HDMI,
+        ]
+        if session.currentRoute.outputs.contains(where: { external.contains($0.portType) }) {
+            try? session.overrideOutputAudioPort(.none)   // respect the plugged-in route
+            return
+        }
+        // Built-in route only: loudspeaker when away from the ear, earpiece when near.
         let near = UIDevice.current.proximityState
-        try? AVAudioSession.sharedInstance().overrideOutputAudioPort(near ? .none : .speaker)
+        try? session.overrideOutputAudioPort(near ? .none : .speaker)
         #endif
     }
 
     private let synth = AVSpeechSynthesizer()
-    private let language = "pt-BR"
+    /// Voice language for native TTS. Follows the app's selected UI language when
+    /// it maps to an installed voice, otherwise the OS default — never a fixed
+    /// pt-BR. `bestVoice(for:)` degrades gracefully if no exact voice exists.
+    private var language: String {
+        let ui = LanguageManager.shared.current.rawValue   // e.g. "en", "ja", "pt-BR"
+        if AVSpeechSynthesisVoice(language: ui) != nil { return ui }
+        return AVSpeechSynthesisVoice.currentLanguageCode()  // OS language, e.g. "en-US"
+    }
 
     // Neural (PocketTTS pt-BR)
     private var pocket: PocketTtsManager?
@@ -72,7 +93,25 @@ final class SpeechManager: NSObject, ObservableObject {
     private var serverVoice: String { UserDefaults.standard.string(forKey: "voice.tts.serverVoice") ?? "" }
     private var serverModel: String { UserDefaults.standard.string(forKey: "voice.tts.serverModel") ?? "" }
 
-    override init() { super.init(); synth.delegate = self }
+    override init() {
+        super.init()
+        synth.delegate = self
+        #if os(iOS)
+        // Free the ~550 MB neural TTS model under memory pressure so iOS doesn't
+        // jetsam the app. It reloads on the next neural synthesis.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [weak self] _ in Task { @MainActor in self?.releaseNeural() } }
+        #endif
+    }
+
+    /// Drop the resident neural model. No-op mid-synthesis so we don't yank it
+    /// out from under an in-flight utterance.
+    func releaseNeural() {
+        guard preparingID == nil, speakingID == nil else { return }
+        neuralTask?.cancel(); neuralTask = nil
+        pocket = nil
+    }
 
     func isSpeaking(_ id: String) -> Bool { speakingID == id }
     func isPreparing(_ id: String) -> Bool { preparingID == id }
@@ -92,6 +131,23 @@ final class SpeechManager: NSObject, ObservableObject {
     func loadServerVoices() async {
         guard let client else { return }
         serverVoices = await client.audioVoices()
+    }
+
+    /// Fetch the server's configured STT/TTS engines (best-effort; needs admin).
+    func loadAudioConfig() async {
+        guard let client else { return }
+        serverAudioConfig = await client.audioConfig()
+    }
+
+    /// Diagnostic dump of the audio endpoints, to figure out what a given server
+    /// actually returns (paths/shapes vary by version).
+    func audioDiagnostics() async -> String {
+        guard let client else { return "No client / not signed in." }
+        var out: [String] = []
+        for path in ["/api/v1/audio/config", "/api/v1/audio/voices", "/api/v1/audio/models"] {
+            out.append(await client.rawGET(path))
+        }
+        return out.joined(separator: "\n\n––––––\n\n")
     }
 
     func stop() {

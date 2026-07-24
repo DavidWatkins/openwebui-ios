@@ -45,10 +45,39 @@ public struct OWChatMessageInput: Encodable, Sendable {
 /// Tuning knobs for a completion.
 public struct OWStreamOptions: Sendable {
     public var temperature: Double?
+    /// Open WebUI per-turn feature flags. The server runs these and folds the
+    /// results back into the reply (search context, generated image, code output).
     public var webSearch: Bool
-    public init(temperature: Double? = nil, webSearch: Bool = false) {
-        self.temperature = temperature; self.webSearch = webSearch
+    public var imageGeneration: Bool
+    public var codeInterpreter: Bool
+    /// Open WebUI tool/function ids to enable for this turn. When set, the server
+    /// runs the function-calling loop (weather, MCP servers exposed as tools, …)
+    /// and streams back the final answer with the tool results incorporated.
+    public var toolIDs: [String]
+    /// Request Open WebUI's NATIVE function-calling mode for this turn, so a raw
+    /// model autonomously calls the tools bound to it (server-side `qwen3_xml`
+    /// parser) instead of relying on a prompt-based pipe. Sent as
+    /// `params.function_calling = "native"`.
+    public var nativeFunctionCalling: Bool
+    /// Whether the model may emit a `<think>` reasoning block. OFF sends
+    /// `chat_template_kwargs.enable_thinking = false` so a reasoning model answers
+    /// directly (faster, no thinking budget spent) — the same switch the title task
+    /// uses. Defaults ON.
+    public var enableThinking: Bool
+    public init(temperature: Double? = nil, webSearch: Bool = false,
+                imageGeneration: Bool = false, codeInterpreter: Bool = false,
+                toolIDs: [String] = [], nativeFunctionCalling: Bool = false,
+                enableThinking: Bool = true) {
+        self.temperature = temperature
+        self.webSearch = webSearch
+        self.imageGeneration = imageGeneration
+        self.codeInterpreter = codeInterpreter
+        self.toolIDs = toolIDs
+        self.nativeFunctionCalling = nativeFunctionCalling
+        self.enableThinking = enableThinking
     }
+
+    var anyFeature: Bool { webSearch || imageGeneration || codeInterpreter }
 }
 
 /// High-level events the UI reacts to as a reply streams in.
@@ -138,7 +167,14 @@ public final class ChatCompletionsClient: @unchecked Sendable {
         req.httpBody = try JSONEncoder().encode(
             Body(model: model, messages: messages, stream: true,
                  temperature: options.temperature, files: files.isEmpty ? nil : files,
-                 features: options.webSearch ? Body.Features(web_search: true) : nil)
+                 tool_ids: options.toolIDs.isEmpty ? nil : options.toolIDs,
+                 features: options.anyFeature
+                    ? Body.Features(web_search: options.webSearch,
+                                    image_generation: options.imageGeneration,
+                                    code_interpreter: options.codeInterpreter)
+                    : nil,
+                 params: options.nativeFunctionCalling ? Body.Params(function_calling: "native") : nil,
+                 chat_template_kwargs: options.enableThinking ? nil : Body.ChatTemplateKwargs(enable_thinking: false))
         )
         return req
     }
@@ -149,8 +185,23 @@ public final class ChatCompletionsClient: @unchecked Sendable {
         var stream: Bool
         var temperature: Double?
         var files: [OWAttachment]?
+        var tool_ids: [String]?
         var features: Features?
-        struct Features: Encodable { var web_search: Bool }
+        var params: Params?
+        var chat_template_kwargs: ChatTemplateKwargs?
+        struct Params: Encodable { var function_calling: String? }
+        struct ChatTemplateKwargs: Encodable { var enable_thinking: Bool }
+        // Only the enabled flags are sent (Open WebUI reads whichever are present).
+        struct Features: Encodable {
+            var web_search: Bool?
+            var image_generation: Bool?
+            var code_interpreter: Bool?
+            init(web_search: Bool, image_generation: Bool, code_interpreter: Bool) {
+                self.web_search = web_search ? true : nil
+                self.image_generation = image_generation ? true : nil
+                self.code_interpreter = code_interpreter ? true : nil
+            }
+        }
     }
 
     private static func extractError(_ body: String) -> String? {

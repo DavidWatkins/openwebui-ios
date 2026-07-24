@@ -65,10 +65,24 @@ struct ThemePickerView: View {
         }
     }
 
-    private func sectionLabel(_ s: String) -> some View {
-        Text(s.uppercased())
+    /// Section header. Takes the pt-BR key and localizes it — earlier this did
+    /// `Text(s.uppercased())`, but `.uppercased()` yields a runtime String and
+    /// `Text(String)` does NOT localize, so every header rendered in Portuguese.
+    /// `LocalizedStringKey` localizes; `.textCase(.uppercase)` handles the casing
+    /// without breaking the lookup (and is a no-op for non-Latin scripts).
+    private func sectionLabel(_ key: LocalizedStringKey) -> some View {
+        Text(key)
+            .textCase(.uppercase)
             .font(.ody(.caption, design: .monospaced))
             .foregroundStyle(theme.secondaryText)
+    }
+
+    /// One-line explanatory note under a control. Literal key → localized.
+    private func caption(_ key: LocalizedStringKey) -> some View {
+        Text(key)
+            .font(.ody(size: 11, design: .monospaced))
+            .foregroundStyle(theme.secondaryText)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     /// Brand themes show their own name; the rest are the Odysseus skins.
@@ -96,15 +110,19 @@ struct ThemePickerView: View {
                 }
             }
             // Transparency
-            Toggle(isOn: Binding(get: { themes.transparency }, set: { themes.transparency = $0 })) {
-                Text("Transparência")
-                    .font(.ody(.subheadline, design: .monospaced))
-                    .foregroundStyle(theme.fg)
+            VStack(alignment: .leading, spacing: 3) {
+                Toggle(isOn: Binding(get: { themes.transparency }, set: { themes.transparency = $0 })) {
+                    Text("Transparência")
+                        .font(.ody(.subheadline, design: .monospaced))
+                        .foregroundStyle(theme.fg)
+                }
+                .tint(theme.accent)
+                caption("Deixa os painéis translúcidos sobre o fundo desfocado.")
             }
-            .tint(theme.accent)
             // Animated background
             VStack(alignment: .leading, spacing: 7) {
                 sectionLabel("Fundo animado")
+                caption("Anima um padrão sutil atrás da conversa.")
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(BackgroundPattern.allCases) { p in
@@ -128,7 +146,7 @@ struct ThemePickerView: View {
             Text(label)
                 .font(labelFont ?? .ody(size: 12, design: .monospaced))
                 .padding(.horizontal, 12).padding(.vertical, 7)
-                .foregroundStyle(selected ? .white : theme.secondaryText)
+                .foregroundStyle(selected ? theme.onAccent : theme.secondaryText)
                 .background(selected ? theme.accent : theme.panel, in: Capsule())
                 .overlay(Capsule().stroke(theme.border, lineWidth: selected ? 0 : 1))
         }

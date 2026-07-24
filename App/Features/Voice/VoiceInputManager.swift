@@ -1,8 +1,12 @@
 import Foundation
 @preconcurrency import AVFoundation
+import Accelerate
 import Speech
 import SwiftWhisper
 import OpenWebUIKit
+#if os(iOS)
+import UIKit
+#endif
 
 /// Records the mic and transcribes to text using the engine chosen in Settings:
 /// **native** (`SFSpeechRecognizer`) or **model** (a downloaded Whisper GGUF via
@@ -21,12 +25,30 @@ final class VoiceInputManager: ObservableObject {
     /// Live mic loudness (RMS, ~0…1) — drives energy-based endpointing for engines
     /// that have no live transcript (server / Whisper).
     @Published var level: Float = 0
+    /// Live FFT magnitude bands (0…1, log-spaced) — drives the spectrum visualizer.
+    @Published var spectrum: [Float] = Array(repeating: 0, count: VoiceInputManager.bandCount)
+
+    // MARK: - FFT (Accelerate)
+    // Immutable read-only setup shared with the nonisolated audio-thread FFT, so
+    // it's marked nonisolated (the class is @MainActor).
+    nonisolated static let bandCount = 28
+    nonisolated private static let fftLog2: vDSP_Length = 10       // 1024-point FFT
+    nonisolated(unsafe) private static let fftSetup: FFTSetup = vDSP_create_fftsetup(fftLog2, FFTRadix(kFFTRadix2))!
+    nonisolated private static let hann: [Float] = {
+        var w = [Float](repeating: 0, count: 1 << Int(fftLog2))
+        vDSP_hann_window(&w, vDSP_Length(w.count), Int32(vDSP_HANN_NORM))
+        return w
+    }()
 
     // A FRESH engine is created for every recording — reusing one instance across
     // start/stop is unstable on macOS (the 2nd use hung the audio HAL on the main
     // thread and then crashed). A new engine means a clean input node + tap.
     private var engine = AVAudioEngine()
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "pt-BR"))
+    /// Recognizer for the app's current language (was hardcoded to pt-BR, which
+    /// transcribed everything else as garbage). Falls back to the device default.
+    private var recognizer: SFSpeechRecognizer? {
+        SFSpeechRecognizer(locale: LanguageManager.shared.locale) ?? SFSpeechRecognizer()
+    }
 
     private static let targetRate: Double = 16_000
     private static let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
@@ -46,12 +68,39 @@ final class VoiceInputManager: ObservableObject {
     private var cachedWhisper: Whisper?
     private var cachedModelID = ""
 
-    private var useModel: Bool { UserDefaults.standard.string(forKey: "voice.stt.engine") == "model" }
-    private var useServer: Bool { UserDefaults.standard.string(forKey: "voice.stt.engine") == "server" }
+    /// Forces a specific STT engine for this instance, overriding the Settings
+    /// choice. The live voice conversation sets this to "native" because only the
+    /// on-device recognizer streams partial transcripts (live text) and supports
+    /// hands-free silence endpointing; server/Whisper are record-then-transcribe.
+    var engineOverride: String?
+    private var sttEngine: String { engineOverride ?? UserDefaults.standard.string(forKey: "voice.stt.engine") ?? "native" }
+    private var useModel: Bool { sttEngine == "model" }
+    private var useServer: Bool { sttEngine == "server" }
     private var activeModelID: String { UserDefaults.standard.string(forKey: "voice.stt.model") ?? "" }
 
     /// Injected at startup — required for the "server" STT engine.
     var client: OpenWebUIClient?
+
+    /// While true the mic tap discards audio (session stays alive) — drives mute.
+    var muted = false
+
+    init() {
+        #if os(iOS)
+        // Free the loaded Whisper model (100s of MB–1 GB+) under memory pressure.
+        // It reloads from disk on the next on-device transcription.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [weak self] _ in Task { @MainActor in self?.releaseModel() } }
+        #endif
+    }
+
+    /// Drop the resident Whisper model. Safe to call anytime — the next
+    /// transcription reloads it (see `transcribeWithWhisper`).
+    func releaseModel() {
+        guard !isRecording, !processing else { return }
+        cachedWhisper = nil
+        cachedModelID = ""
+    }
 
     // MARK: - Start
 
@@ -109,12 +158,18 @@ final class VoiceInputManager: ObservableObject {
             let req = SFSpeechAudioBufferRecognitionRequest()
             req.shouldReportPartialResults = true
             req.requiresOnDeviceRecognition = rec.supportsOnDeviceRecognition
+            req.addsPunctuation = true   // "?" at the end of a spoken question, commas, etc.
             request = req
             task = rec.recognitionTask(with: req) { [weak self] result, err in
                 Task { @MainActor in
                     guard let self else { return }
                     if let result {
-                        self.partialText = result.bestTranscription.formattedString
+                        // Never overwrite a good transcript with an empty one — on an
+                        // abrupt stop SFSpeechRecognizer often delivers an EMPTY final
+                        // result, which used to wipe the live text → "didn't catch
+                        // any speech" even though we clearly heard the user.
+                        let s = result.bestTranscription.formattedString
+                        if !s.isEmpty { self.partialText = s }
                         if result.isFinal { self.sawFinal = true }
                     }
                     if let err { self.error = L("Reconhecimento: %@", err.localizedDescription); self.sawFinal = true }
@@ -122,10 +177,24 @@ final class VoiceInputManager: ObservableObject {
             }
         }
 
-        input.installTap(onBus: 0, bufferSize: 8192, format: inputFormat) { [weak self] buffer, _ in
+        // Smaller buffer → the level/FFT update ~4× more often (smoother visualizer,
+        // snappier endpointing). Still ≥ the 1024-sample FFT window.
+        input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
-            let lvl = Self.rms(buffer)
-            Task { @MainActor in self.level = lvl }
+            // Muted: report silence and don't feed the recognizer, but keep the
+            // engine running so the session stays alive (tap again to unmute).
+            if self.muted {
+                Task { @MainActor in self.level = 0; self.spectrum = Array(repeating: 0, count: Self.bandCount) }
+                return
+            }
+            // Raw RMS of float PCM speech is tiny (~0.02–0.08), and `.measurement`
+            // mode disables input gain — far below what the orb needs to visibly
+            // react or what energy-endpointing can threshold. Boost to a usable
+            // 0…1 range (perceptual: emphasise the quiet end so a normal voice
+            // clearly registers).
+            let lvl = min(1, Self.rms(buffer).squareRoot() * 1.6)
+            let bands = Self.computeSpectrum(buffer)
+            Task { @MainActor in self.level = lvl; if !bands.isEmpty { self.spectrum = bands } }
             if self.captureToModel { self.captureRaw(buffer) }
             else { self.request?.append(buffer) }
         }
@@ -149,15 +218,18 @@ final class VoiceInputManager: ObservableObject {
     func stop() async -> String {
         guard isRecording else { return "" }
         isRecording = false
-        tearDownEngine()
-        request?.endAudio()
-        deactivateSession()
+        tearDownEngine()       // stop the engine + tap first (no appends after endAudio)
+        request?.endAudio()    // then let the recognizer finalize the buffered audio
 
-        if useServer { return await transcribeWithServer() }
-        if useModel { return await transcribeWithWhisper() }
+        // Server/Whisper transcribe the captured raw samples — the session can go now.
+        if useServer { deactivateSession(); return await transcribeWithServer() }
+        if useModel { deactivateSession(); return await transcribeWithWhisper() }
 
+        // Native: wait for the final result BEFORE deactivating the session, so the
+        // recognizer can emit its last transcript.
         for _ in 0..<30 { if sawFinal { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
         task?.cancel(); task = nil; request = nil
+        deactivateSession()
         let text = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty && error == nil { error = L("Não captei nenhuma fala.") }
         return text
@@ -345,6 +417,46 @@ final class VoiceInputManager: ObservableObject {
         var sum: Float = 0
         for i in 0..<n { let s = ch[i]; sum += s * s }
         return (sum / Float(n)).squareRoot()
+    }
+
+    /// Windowed FFT → `bandCount` log-spaced magnitude bands in 0…1, dB-scaled with
+    /// a high-sensitivity floor so a normal voice fills the bars. Runs on the audio
+    /// thread (nonisolated, pure aside from the immutable static FFT setup).
+    nonisolated static func computeSpectrum(_ buffer: AVAudioPCMBuffer) -> [Float] {
+        let n = 1 << Int(fftLog2)
+        guard let ch = buffer.floatChannelData?[0], Int(buffer.frameLength) >= n else { return [] }
+        var windowed = [Float](repeating: 0, count: n)
+        vDSP_vmul(ch, 1, hann, 1, &windowed, 1, vDSP_Length(n))
+
+        let half = n / 2
+        var real = [Float](repeating: 0, count: half)
+        var imag = [Float](repeating: 0, count: half)
+        var mags = [Float](repeating: 0, count: half)
+        windowed.withUnsafeBufferPointer { wp in
+            wp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: half) { cp in
+                real.withUnsafeMutableBufferPointer { rp in
+                    imag.withUnsafeMutableBufferPointer { ip in
+                        var split = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+                        vDSP_ctoz(cp, 2, &split, 1, vDSP_Length(half))
+                        vDSP_fft_zrip(fftSetup, &split, 1, fftLog2, FFTDirection(FFT_FORWARD))
+                        vDSP_zvmags(&split, 1, &mags, 1, vDSP_Length(half))
+                    }
+                }
+            }
+        }
+
+        // Log-spaced bands over bins [1, half); dB-scale each with a generous floor.
+        var out = [Float](repeating: 0, count: bandCount)
+        let minBin = 1.0, maxBin = Double(half)
+        for b in 0..<bandCount {
+            let lo = Int(minBin * pow(maxBin / minBin, Double(b) / Double(bandCount)))
+            let hi = max(lo + 1, Int(minBin * pow(maxBin / minBin, Double(b + 1) / Double(bandCount))))
+            var peak: Float = 0
+            for i in lo..<min(hi, half) { peak = max(peak, mags[i]) }
+            let db = 10 * log10f(peak + 1e-9)          // power → dB
+            out[b] = min(1, max(0, (db + 80) / 80))    // -80 dB floor → high sensitivity
+        }
+        return out
     }
 
     /// Copies raw mono samples (hardware rate) — fast + safe inside the tap.

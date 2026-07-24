@@ -15,6 +15,8 @@ struct VoiceSettingsView: View {
     @AppStorage("voice.bargein.enabled") private var bargeEnabled = true
     @AppStorage("voice.bargein.sensitivity") private var bargeSensitivity = 0.5
     @State private var langFilter = "all"
+    @State private var audioDiag = ""
+    @State private var runningDiag = false
 
     private var lang: VoiceLang? { VoiceLang(rawValue: langFilter) }
 
@@ -29,6 +31,9 @@ struct VoiceSettingsView: View {
                 if sttEngine == "model" {
                     LabeledContent("Modelo ativo", value: modelName(sttModelID) ?? L("nenhum"))
                 }
+                if let cfg = speech.serverAudioConfig {
+                    LabeledContent("Motor no servidor", value: cfg.sttSummary)
+                }
             } header: { Text("Voz → Texto") } footer: {
                 Text("Nativo = transcrição ao vivo enquanto você fala (tipo Claude/Gemini). \"Modelo\" = Whisper offline no aparelho. \"Servidor\" = o Whisper do seu Open WebUI (envia o áudio e transcreve no fim).")
             }
@@ -38,6 +43,9 @@ struct VoiceSettingsView: View {
                     Text("Nativo iOS").tag("native")
                     Text("Neural pt-BR").tag("neural")
                     Text("Servidor").tag("server")
+                }
+                if let cfg = speech.serverAudioConfig {
+                    LabeledContent("Motor no servidor", value: cfg.ttsSummary)
                 }
                 if ttsEngine == "server" {
                     if !speech.serverVoices.isEmpty {
@@ -124,6 +132,33 @@ struct VoiceSettingsView: View {
                                    value: ByteCountFormatter.string(fromByteCount: downloads.totalInstalledBytes(), countStyle: .file))
                 }
             }
+
+            // Diagnostic tool (verbatim English — a debug aid, not a localized
+            // feature): dumps what the server returns for the audio endpoints so
+            // STT/TTS discovery can be mapped to a given Open WebUI version.
+            Section {
+                Button {
+                    runningDiag = true
+                    Task { audioDiag = await speech.audioDiagnostics(); runningDiag = false }
+                } label: {
+                    if runningDiag {
+                        HStack { ProgressView(); Text(verbatim: "Running…") }
+                    } else {
+                        Label(title: { Text(verbatim: "Test audio endpoints") },
+                              icon: { Image(systemName: "stethoscope") })
+                    }
+                }
+                if !audioDiag.isEmpty {
+                    Text(verbatim: audioDiag)
+                        .font(.system(size: 10, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } header: {
+                Text(verbatim: "SERVER AUDIO DIAGNOSTICS")
+            } footer: {
+                Text(verbatim: "Shows what your Open WebUI returns for the audio endpoints. Long-press the output to copy it.")
+            }
         }
         .navigationTitle("Voz e modelos")
         .navigationBarTitleDisplayMode(.inline)
@@ -131,6 +166,7 @@ struct VoiceSettingsView: View {
         .background(theme.bg)
         .tint(theme.accent)
         .onAppear { downloads.refresh() }
+        .task { await speech.loadAudioConfig() }
         .task(id: ttsEngine) { if ttsEngine == "server" { await speech.loadServerVoices() } }
         .alert("Erro no download", isPresented: Binding(get: { downloads.error != nil }, set: { if !$0 { downloads.error = nil } })) {
             Button("OK") { downloads.error = nil }
