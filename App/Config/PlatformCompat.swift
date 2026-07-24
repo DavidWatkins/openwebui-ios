@@ -26,6 +26,21 @@ extension ToolbarItemPlacement {
     }
 }
 
+// MARK: - Sheet sizing (both platforms)
+
+extension View {
+    /// macOS sheets don't size to content like iOS detents — an unsized sheet
+    /// root collapses. Give it a working minimum; no-op on iOS.
+    @ViewBuilder
+    func macSheetFrame(_ width: CGFloat = 620, _ height: CGFloat = 560) -> some View {
+        #if os(macOS)
+        self.frame(minWidth: width, minHeight: height)
+        #else
+        self
+        #endif
+    }
+}
+
 // MARK: - iOS-only view modifiers, stubbed to no-ops on macOS
 
 #if os(macOS)
