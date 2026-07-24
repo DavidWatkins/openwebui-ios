@@ -91,6 +91,13 @@ extension NSImage {
     }
 }
 
+/// Cross-platform "copy text to clipboard" (NSPasteboard here, UIPasteboard on iOS).
+@MainActor
+func owCopyToClipboard(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+}
+
 /// "Save image": on the Mac that's a save panel (sandbox-friendly), not Photos.
 @MainActor
 func owSaveImage(_ image: OWPlatformImage) {
@@ -129,6 +136,12 @@ typealias OWPlatformImage = UIImage
 
 extension Image {
     init(platformImage img: OWPlatformImage) { self.init(uiImage: img) }
+}
+
+/// Cross-platform "copy text to clipboard" (UIPasteboard here, NSPasteboard on macOS).
+@MainActor
+func owCopyToClipboard(_ text: String) {
+    UIPasteboard.general.string = text
 }
 
 @MainActor

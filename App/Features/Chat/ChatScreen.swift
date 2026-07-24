@@ -22,6 +22,11 @@ struct ChatScreen: View {
     @State private var comingSoon: String?
     @State private var showVoice = false
     @State private var showTools = false
+    /// Whether the user is at (or near) the end of the transcript. Streaming only
+    /// auto-scrolls while pinned, so scrolling up to re-read mid-reply sticks.
+    @State private var pinnedToBottom = true
+    /// Bumped on each send so `.sensoryFeedback` fires a light tap.
+    @State private var sendFeedback = 0
 
     init(app: AppState, chat: OWChatSummary?, mode: ChatMode? = nil, onChanged: @escaping () -> Void) {
         let model = app.makeChatViewModel(chat: chat, mode: mode)
@@ -37,6 +42,10 @@ struct ChatScreen: View {
                 composer
             }
         }
+        // Haptics: a light tap on send, a success tap when the reply finishes
+        // (true→false only — not when a stream starts). No-ops on macOS.
+        .sensoryFeedback(.impact(weight: .light), trigger: sendFeedback)
+        .sensoryFeedback(.success, trigger: vm.isStreaming) { old, new in old && !new }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
@@ -132,42 +141,94 @@ struct ChatScreen: View {
     // MARK: - Messages
 
     private var messages: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                if vm.isLoadingHistory && vm.messages.isEmpty {
-                    ProgressView().tint(theme.accent).padding(.top, 80)
-                } else if vm.messages.isEmpty {
-                    welcome.padding(.top, 60)
+        GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    if vm.isLoadingHistory && vm.messages.isEmpty {
+                        ProgressView().tint(theme.accent).padding(.top, 80)
+                    } else if vm.messages.isEmpty {
+                        welcome.padding(.top, 60)
+                    }
+                    LazyVStack(spacing: 16) {
+                        ForEach(Array(vm.messages.enumerated()), id: \.element.id) { idx, msg in
+                            let streaming = vm.isStreaming && idx == vm.messages.count - 1 && msg.role == .assistant
+                            MessageBubble(
+                                message: msg,
+                                isStreaming: streaming,
+                                client: app.client,
+                                branch: vm.branchInfo(for: msg.id),
+                                models: app.models,
+                                // Tool activity ("🔧 web_search: …") shows inline under this
+                                // reply while it runs — only on the message being generated.
+                                toolStatus: streaming ? vm.toolStatus : nil,
+                                tokPerSec: msg.role == .assistant ? vm.genRate[msg.id] : nil,
+                                onEdit: msg.role == .user ? { vm.editUser(messageID: msg.id, newText: $0) } : nil,
+                                onRegenerate: msg.role == .assistant ? { vm.regenerate(messageID: msg.id) } : nil,
+                                onRetryModel: msg.role == .assistant ? { vm.regenerate(messageID: msg.id, model: $0) } : nil,
+                                onBranch: { vm.switchBranch(messageID: msg.id, delta: $0) }
+                            )
+                            .id(msg.id)
+                        }
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 16)
+                    // Bottom sentinel: its position inside the viewport tells us
+                    // whether the user is pinned to the end of the transcript.
+                    Color.clear.frame(height: 1).id("bottom")
+                        .background(GeometryReader { geo in
+                            Color.clear.preference(key: BottomEdgeKey.self,
+                                                   value: geo.frame(in: .named("chatScroll")).minY)
+                        })
                 }
-                LazyVStack(spacing: 16) {
-                    ForEach(Array(vm.messages.enumerated()), id: \.element.id) { idx, msg in
-                        let streaming = vm.isStreaming && idx == vm.messages.count - 1 && msg.role == .assistant
-                        MessageBubble(
-                            message: msg,
-                            isStreaming: streaming,
-                            client: app.client,
-                            branch: vm.branchInfo(for: msg.id),
-                            models: app.models,
-                            // Tool activity ("🔧 web_search: …") shows inline under this
-                            // reply while it runs — only on the message being generated.
-                            toolStatus: streaming ? vm.toolStatus : nil,
-                            tokPerSec: msg.role == .assistant ? vm.genRate[msg.id] : nil,
-                            onEdit: msg.role == .user ? { vm.editUser(messageID: msg.id, newText: $0) } : nil,
-                            onRegenerate: msg.role == .assistant ? { vm.regenerate(messageID: msg.id) } : nil,
-                            onRetryModel: msg.role == .assistant ? { vm.regenerate(messageID: msg.id, model: $0) } : nil,
-                            onBranch: { vm.switchBranch(messageID: msg.id, delta: $0) }
-                        )
-                        .id(msg.id)
+                .coordinateSpace(name: "chatScroll")
+                .onPreferenceChange(BottomEdgeKey.self) { minY in
+                    let pinned = minY < viewport.size.height + 60
+                    if pinned != pinnedToBottom { pinnedToBottom = pinned }
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .refreshable { await vm.reloadHistory() }
+                // Per-token updates: follow the stream only while pinned, and
+                // without animation — animated per-token scrolls rubber-band.
+                .onChange(of: vm.messages.last?.content) { _, _ in
+                    if pinnedToBottom { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .onChange(of: vm.toolStatus) { _, _ in
+                    if pinnedToBottom { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                // A new message (send/regenerate/branch) is user-initiated —
+                // scroll gently and re-pin. Same when the keyboard opens.
+                .onChange(of: vm.messages.count) { _, _ in
+                    pinnedToBottom = true
+                    scrollToBottom(proxy)
+                }
+                .onChange(of: inputFocused) { _, focused in
+                    if focused {
+                        pinnedToBottom = true
+                        scrollToBottom(proxy)
                     }
                 }
-                .padding(.horizontal, 14).padding(.vertical, 16)
-                Color.clear.frame(height: 1).id("bottom")
+                // "Jump to latest" pill, shown only while scrolled up.
+                .overlay(alignment: .bottomTrailing) {
+                    if !pinnedToBottom {
+                        Button {
+                            pinnedToBottom = true
+                            scrollToBottom(proxy)
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.ody(size: 14, weight: .semibold))
+                                .foregroundStyle(theme.fg)
+                                .frame(width: 38, height: 38)
+                                .background(theme.panel, in: Capsule())
+                                .overlay(Capsule().stroke(theme.border, lineWidth: 1))
+                                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 14).padding(.bottom, 10)
+                        .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                        .accessibilityLabel(Text("Ir para o fim"))
+                    }
+                }
+                .animation(.easeInOut(duration: 0.15), value: pinnedToBottom)
             }
-            .scrollDismissesKeyboard(.interactively)
-            .refreshable { await vm.reloadHistory() }
-            .onChange(of: vm.messages.last?.content) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: vm.messages.count) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: vm.toolStatus) { _, _ in scrollToBottom(proxy) }
         }
     }
 
@@ -489,6 +550,7 @@ struct ChatScreen: View {
         }
         .padding(12)
         .background(theme.panel, in: RoundedRectangle(cornerRadius: 14))
+        .sensoryFeedback(.selection, trigger: on.wrappedValue)
     }
 
     private func toggleChip(system: String, label: String, on: Binding<Bool>) -> some View {
@@ -503,6 +565,7 @@ struct ChatScreen: View {
             .overlay(Capsule().stroke(theme.border, lineWidth: on.wrappedValue ? 0 : 1))
         }
         .buttonStyle(.plain)
+        .sensoryFeedback(.selection, trigger: on.wrappedValue)
     }
 
     private var canSend: Bool {
@@ -515,6 +578,14 @@ struct ChatScreen: View {
 
     /// Route the composer's send action: image generation or a chat turn.
     private func submitComposer() {
+        sendFeedback += 1
         if vm.imageMode { vm.generateImage() } else { vm.send() }
     }
+}
+
+/// Where the bottom sentinel sits inside the scroll viewport (its minY in the
+/// "chatScroll" coordinate space) — drives the pinned-to-bottom detection.
+private struct BottomEdgeKey: PreferenceKey {
+    static var defaultValue: CGFloat = .infinity
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

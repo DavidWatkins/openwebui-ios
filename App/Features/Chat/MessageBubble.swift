@@ -32,6 +32,8 @@ struct MessageBubble: View {
     /// User preference: keep the reasoning disclosure open once thinking is done
     /// (default is to collapse it). Set in Settings.
     @AppStorage("reasoning.expandedByDefault") private var reasoningExpandedByDefault = false
+    /// Bumped on each `‹ ›` branch switch so `.sensoryFeedback` fires a tick.
+    @State private var branchTap = 0
 
     struct ViewerImage: Identifiable { let id = UUID(); let url: String }
 
@@ -94,22 +96,26 @@ struct MessageBubble: View {
     }
 
     /// Inline actions under a settled message: branch switcher + (assistant)
-    /// regenerate / retry-with-model. Kept subtle, ChatGPT/Claude-style.
+    /// copy / regenerate / retry-with-model. Kept subtle, ChatGPT/Claude-style.
     @ViewBuilder
     private var actionBar: some View {
-        let hasActions = branch != nil || (!isUser && (onRegenerate != nil || onRetryModel != nil))
+        let canCopy = !isUser && !message.content.isEmpty
+        let hasActions = branch != nil || canCopy || (!isUser && (onRegenerate != nil || onRetryModel != nil))
         if hasActions {
-            HStack(spacing: 16) {
+            HStack(spacing: 20) {
                 if let b = branch { branchNav(b) }
+                if canCopy { CopyButton(text: message.content, size: 12) }
                 if !isUser, let onRegenerate {
-                    Button { onRegenerate() } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.plain)
+                    Button { onRegenerate() } label: {
+                        Image(systemName: "arrow.clockwise").actionHitTarget()
+                    }
+                    .buttonStyle(.plain)
                 }
                 if !isUser, !models.isEmpty, let onRetryModel {
                     Menu {
                         ForEach(models) { m in Button(m.shortName) { onRetryModel(m.id) } }
                     } label: {
-                        Image(systemName: "arrow.triangle.2.circlepath")
+                        Image(systemName: "arrow.triangle.2.circlepath").actionHitTarget()
                     }
                 }
             }
@@ -122,21 +128,24 @@ struct MessageBubble: View {
 
     private func branchNav(_ b: (index: Int, total: Int)) -> some View {
         HStack(spacing: 9) {
-            Button { onBranch?(-1) } label: { Image(systemName: "chevron.left") }
-                .buttonStyle(.plain).disabled(b.index <= 1)
+            Button { branchTap += 1; onBranch?(-1) } label: {
+                Image(systemName: "chevron.left").actionHitTarget()
+            }
+            .buttonStyle(.plain).disabled(b.index <= 1)
             Text("\(b.index)/\(b.total)").font(.ody(size: 11, design: .monospaced))
-            Button { onBranch?(1) } label: { Image(systemName: "chevron.right") }
-                .buttonStyle(.plain).disabled(b.index >= b.total)
+            Button { branchTap += 1; onBranch?(1) } label: {
+                Image(systemName: "chevron.right").actionHitTarget()
+            }
+            .buttonStyle(.plain).disabled(b.index >= b.total)
         }
+        .sensoryFeedback(.selection, trigger: branchTap)
     }
 
     @ViewBuilder
     private var messageMenu: some View {
         if !message.content.isEmpty {
             Button {
-                #if canImport(UIKit)
-                UIPasteboard.general.string = message.content
-                #endif
+                owCopyToClipboard(message.content)
             } label: { Label(L("Copiar"), systemImage: "doc.on.doc") }
         }
         if isUser, onEdit != nil {
@@ -277,7 +286,9 @@ struct MessageBubble: View {
         Group {
             if message.content.isEmpty && isStreaming {
                 TypingDots()
-            } else if isUser {
+            } else if isUser || isStreaming {
+                // While the reply streams, render plain text — re-parsing Markdown on
+                // every token makes the whole transcript churn. Settles to Markdown.
                 Text(message.content)
                     .font(.ody(.body, design: .monospaced))
                     .foregroundStyle(theme.fg)
@@ -288,6 +299,9 @@ struct MessageBubble: View {
                     .markdownTextStyle(\.code) {
                         FontFamilyVariant(.monospaced)
                         BackgroundColor(theme.panel)
+                    }
+                    .markdownBlockStyle(\.codeBlock) { configuration in
+                        CodeBlockView(configuration: configuration)
                     }
                     .textSelection(.enabled)
             }
@@ -300,23 +314,90 @@ struct MessageBubble: View {
     }
 }
 
-/// Three-dot pulsing indicator while waiting for the first token.
+/// Three-dot pulsing indicator while waiting for the first token. One flipped
+/// state drives all three dots; the per-dot delay staggers them into a wave.
 struct TypingDots: View {
     @Environment(\.theme) private var theme
-    @State private var phase = 0.0
+    @State private var animating = false
     var body: some View {
         HStack(spacing: 5) {
             ForEach(0..<3) { i in
                 Circle()
                     .fill(theme.fg.opacity(0.7))
                     .frame(width: 7, height: 7)
-                    .scaleEffect(phase == Double(i) ? 1.0 : 0.5)
+                    .scaleEffect(animating ? 1 : 0.5)
+                    .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true).delay(Double(i) * 0.16),
+                               value: animating)
             }
         }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.5).repeatForever()) { phase = 2 }
-        }
+        .onAppear { animating = true }
         .frame(height: 14)
+    }
+}
+
+// MARK: - Action-bar helpers
+
+extension View {
+    /// Comfortable ~32pt tap target for the tiny glyph buttons in the action row.
+    func actionHitTarget() -> some View {
+        frame(minWidth: 32, minHeight: 32).contentShape(Rectangle())
+    }
+}
+
+/// Copy-to-clipboard glyph button: light haptic + a transient checkmark (~1.2s).
+struct CopyButton: View {
+    let text: String
+    var size: CGFloat = 12
+    @Environment(\.theme) private var theme
+    @State private var copied = false
+    /// Bumped per tap so `.sensoryFeedback` fires even on rapid re-copies.
+    @State private var copyTap = 0
+
+    var body: some View {
+        Button {
+            owCopyToClipboard(text)
+            copyTap += 1
+            copied = true
+            Task { try? await Task.sleep(nanoseconds: 1_200_000_000); copied = false }
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .font(.ody(size: size))
+                .foregroundStyle(copied ? theme.accent : theme.secondaryText)
+                .actionHitTarget()
+        }
+        .buttonStyle(.plain)
+        .sensoryFeedback(.impact(weight: .light), trigger: copyTap)
+    }
+}
+
+/// Fenced code block: panel surface, horizontal scroll for long lines, a small
+/// language chip, and a copy button for the raw code.
+struct CodeBlockView: View {
+    let configuration: CodeBlockConfiguration
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                configuration.label
+                    .markdownTextStyle { FontFamilyVariant(.monospaced) }
+                    .padding(12)
+                    .padding(.trailing, 40)   // keep the first line clear of the controls
+            }
+            HStack(spacing: 2) {
+                if let lang = configuration.language, !lang.isEmpty {
+                    Text(lang)
+                        .font(.ody(size: 10, design: .monospaced))
+                        .foregroundStyle(theme.secondaryText)
+                        .padding(.horizontal, 7).padding(.vertical, 2)
+                        .background(theme.bg.opacity(0.6), in: Capsule())
+                }
+                CopyButton(text: configuration.content, size: 11)
+            }
+            .padding(.horizontal, 4)
+        }
+        .background(theme.panel, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.border.opacity(0.4), lineWidth: 1))
     }
 }
 

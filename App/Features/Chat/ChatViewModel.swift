@@ -349,11 +349,13 @@ final class ChatViewModel: ObservableObject {
 
         var sawContent = false
         // Live tok/s: clock starts at the first token (reasoning or content) and the
-        // rate counts reasoning + answer, updated each cumulative frame.
+        // rate counts reasoning + answer. Local counters mirror the cumulative
+        // frames so the flush-driven tick doesn't have to re-read `messages`.
         var genStart: Date?
-        func tick() {
-            guard let s = genStart, let i = index(of: assistant.id) else { return }
-            tickRate(assistant.id, chars: messages[i].content.count + (messages[i].reasoning?.count ?? 0), start: s)
+        var contentChars = 0, reasonChars = 0
+        streamTick = { [weak self] in
+            guard let self, let s = genStart else { return }
+            self.tickRate(assistant.id, chars: contentChars + reasonChars, start: s)
         }
         let options = OWStreamOptions(webSearch: false, imageGeneration: imageGeneration,
                                       codeInterpreter: codeInterpreter, toolIDs: Array(selectedToolIDs),
@@ -364,14 +366,14 @@ final class ChatViewModel: ObservableObject {
             switch update {
             case .content(let full):
                 sawContent = true
-                toolStatus = nil                 // answer is arriving → tools are done
-                setContent(assistant.id, full)   // cumulative → replace, not append
+                toolStatus = nil                   // answer is arriving → tools are done
+                contentChars = full.count
+                queueContent(assistant.id, full)   // cumulative → replace, not append
                 if genStart == nil { genStart = Date() }
-                tick()
             case .reasoning(let full):
-                setReasoning(assistant.id, full) // cumulative → replace, not append
+                reasonChars = full.count
+                queueReasoning(assistant.id, full) // cumulative → replace, not append
                 if genStart == nil { genStart = Date() }
-                tick()
             case .toolUse(let t):
                 toolStatus = nil                 // the run finished → drop the spinner
                 addToolUse(assistant.id, t)
@@ -380,11 +382,13 @@ final class ChatViewModel: ObservableObject {
             case .done:
                 break
             case .error(let msg):
+                finishStreamUI()   // land anything queued before placing the error
                 let m = friendlyError(msg)
                 if let i = index(of: assistant.id), messages[i].content.isEmpty { messages[i].content = "⚠️ \(m)" }
                 else { self.error = m }
             }
         }
+        finishStreamUI()   // guaranteed final flush — the last frame always lands
         // A buffered pipe reply (the Agent) runs its whole tool + reasoning loop
         // server-side and writes the answer only at the very end — often AFTER the
         // socket stream has already closed. If we caught no content, the reply is
@@ -467,7 +471,14 @@ final class ChatViewModel: ObservableObject {
     private func runStream(model: String, convo: [OWChatMessageInput],
                            files: [OWAttachment], assistantID: String) async {
         var sawText = false
+        // Deltas accumulate into local buffers; the throttle publishes the latest
+        // full text so `messages` isn't republished per token.
+        var text = "", reason = ""
         var genStart: Date?, genChars = 0
+        streamTick = { [weak self] in
+            guard let self, let s = genStart else { return }
+            self.tickRate(assistantID, chars: genChars, start: s)
+        }
         do {
             for try await update in completions.stream(model: model, messages: convo, files: files,
                                                        options: OWStreamOptions(webSearch: false,
@@ -480,25 +491,27 @@ final class ChatViewModel: ObservableObject {
                     sawText = true
                     if genStart == nil { genStart = Date() }
                     genChars += d.count
-                    append(assistantID, d)
-                    if let s = genStart { tickRate(assistantID, chars: genChars, start: s) }
+                    text += d
+                    queueContent(assistantID, text)
                 case .reasoningDelta(let d):
                     if genStart == nil { genStart = Date() }
                     genChars += d.count
-                    appendReasoning(assistantID, d)
-                    if let s = genStart { tickRate(assistantID, chars: genChars, start: s) }
+                    reason += d
+                    queueReasoning(assistantID, reason)
                 case .error(let msg):
-                    setContent(assistantID, friendlyError(msg))
+                    queueContent(assistantID, friendlyError(msg))
                 case .done:
                     break
                 }
             }
+            finishStreamUI()
             if !sawText, let i = index(of: assistantID), messages[i].content.isEmpty {
                 messages[i].content = L("_(sem resposta)_")
             }
         } catch is CancellationError {
-            // user stopped — keep whatever streamed so far
+            finishStreamUI()   // user stopped — keep whatever streamed so far
         } catch {
+            finishStreamUI()
             let msg = friendlyError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             if let i = index(of: assistantID), messages[i].content.isEmpty {
                 messages[i].content = "⚠️ \(msg)"
@@ -523,6 +536,10 @@ final class ChatViewModel: ObservableObject {
         var reasonings: [String] = []
         var genStart: Date?, genChars = 0
         let maxIterations = 5
+        streamTick = { [weak self] in
+            guard let self, let s = genStart else { return }
+            self.tickRate(assistantID, chars: genChars, start: s)
+        }
 
         do {
             for _ in 0..<maxIterations {
@@ -544,17 +561,16 @@ final class ChatViewModel: ObservableObject {
                             streamingAnswer = true
                         }
                         if streamingAnswer {
-                            toolStatus = nil; setContent(assistantID, step)
+                            toolStatus = nil; queueContent(assistantID, step)
                             if genStart == nil { genStart = Date() }
                             genChars += d.count
-                            if let s = genStart { tickRate(assistantID, chars: genChars, start: s) }
                         } else { toolStatus = L("Pensando…") }
                     case .reasoningDelta(let d):
-                        stepReason += d; setReasoning(assistantID, stepReason)
+                        stepReason += d; queueReasoning(assistantID, stepReason)
                         if genStart == nil { genStart = Date() }
                         genChars += d.count
-                        if let s = genStart { tickRate(assistantID, chars: genChars, start: s) }
                     case .error(let msg):
+                        finishStreamUI()
                         setContent(assistantID, friendlyError(msg)); toolStatus = nil; isStreaming = false
                         await persist(); return
                     case .done: break
@@ -574,10 +590,14 @@ final class ChatViewModel: ObservableObject {
                 convo.append(OWChatMessageInput(role: "assistant", text: step))
                 convo.append(OWChatMessageInput(role: "user",
                     text: "Tool result:\n\(result.text)\n\nUsing this, answer my previous question directly. Do not output JSON or call another tool unless truly necessary."))
+                flushStreamUI()               // nothing queued may land after the clear
                 setContent(assistantID, "")   // clear any stray partial before the next step
             }
+            finishStreamUI()
         } catch is CancellationError {
+            finishStreamUI()   // keep whatever streamed so far
         } catch {
+            finishStreamUI()
             let msg = friendlyError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             if let i = index(of: assistantID), messages[i].content.isEmpty { messages[i].content = "⚠️ \(msg)" }
             else { self.error = msg }
@@ -869,18 +889,63 @@ final class ChatViewModel: ObservableObject {
     }
     private var persistChain: Task<Void, Never>?
 
+    // MARK: - Stream UI throttling
+
+    // Publishing `messages` on every token makes SwiftUI re-diff the whole
+    // transcript per delta. The stream paths queue the LATEST full text here and
+    // a ~40ms gate applies it, so the UI updates at most ~25×/s no matter the
+    // token rate. `finishStreamUI()` is the guaranteed final flush.
+    private var pendingContent: [String: String] = [:]
+    private var pendingReasoning: [String: String] = [:]
+    private var lastFlush = Date.distantPast
+    private var flushTask: Task<Void, Never>?
+    /// Per-turn tok/s updater, run after each applied flush so the header rate
+    /// keeps pace with the throttled UI (not with every raw delta).
+    private var streamTick: (() -> Void)?
+
+    private func queueContent(_ id: String, _ text: String) {
+        pendingContent[id] = text; scheduleFlush()
+    }
+    private func queueReasoning(_ id: String, _ text: String) {
+        pendingReasoning[id] = text; scheduleFlush()
+    }
+
+    private func scheduleFlush() {
+        if Date().timeIntervalSince(lastFlush) >= 0.04 { flushPending(); return }
+        guard flushTask == nil else { return }   // one trailing flush is enough
+        flushTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            self.flushTask = nil
+            self.flushPending()
+        }
+    }
+
+    private func flushPending() {
+        guard !pendingContent.isEmpty || !pendingReasoning.isEmpty else { return }
+        lastFlush = Date()
+        for (id, text) in pendingContent { setContent(id, text) }
+        for (id, text) in pendingReasoning { setReasoning(id, text) }
+        pendingContent = [:]; pendingReasoning = [:]
+        streamTick?()
+    }
+
+    /// Apply anything still queued right now (cancels the trailing timer so a
+    /// stale write can't land after e.g. the agent loop clears the bubble).
+    private func flushStreamUI() {
+        flushTask?.cancel(); flushTask = nil
+        flushPending()
+    }
+
+    /// End-of-stream flush: the last frame always lands, then the turn's tick
+    /// closure is dropped.
+    private func finishStreamUI() {
+        flushStreamUI()
+        streamTick = nil
+    }
+
     // MARK: - Mutation helpers
 
     private func index(of id: String) -> Int? { messages.firstIndex { $0.id == id } }
-    private func append(_ id: String, _ text: String) {
-        if let i = index(of: id) { messages[i].content += text }
-    }
-    /// Seeds `reasoning` on the first delta (nil → "") so the disclosure appears
-    /// as soon as the model starts thinking, before any text arrives.
-    private func appendReasoning(_ id: String, _ text: String) {
-        guard let i = index(of: id) else { return }
-        messages[i].reasoning = (messages[i].reasoning ?? "") + text
-    }
     private func setContent(_ id: String, _ text: String) {
         if let i = index(of: id) { messages[i].content = text }
     }
