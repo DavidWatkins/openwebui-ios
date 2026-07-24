@@ -491,6 +491,11 @@ final class ChatViewModel: ObservableObject {
             guard let self, let s = genStart else { return }
             self.tickRate(assistantID, chars: genChars, start: s)
         }
+        // Persist up front so a brand-new chat gets an id immediately — that lists it
+        // and lets you leave and re-enter (re-attaching to this live stream) mid-reply.
+        // Only runSocketTurn did this before; without it this path creates the chat
+        // only when the reply finishes, leaving the in-progress conversation unreachable.
+        if chatID == nil { await persist() }
         do {
             for try await update in completions.stream(model: model, messages: convo, files: files,
                                                        options: OWStreamOptions(webSearch: false,
@@ -552,6 +557,11 @@ final class ChatViewModel: ObservableObject {
             guard let self, let s = genStart else { return }
             self.tickRate(assistantID, chars: genChars, start: s)
         }
+        // Persist up front so a brand-new chat gets an id immediately — that lists it
+        // and lets you leave and re-enter (re-attaching to this live stream) while the
+        // tool loop runs. Otherwise this path creates the chat only when it finishes,
+        // leaving the in-progress conversation unreachable.
+        if chatID == nil { await persist() }
 
         do {
             for _ in 0..<maxIterations {
