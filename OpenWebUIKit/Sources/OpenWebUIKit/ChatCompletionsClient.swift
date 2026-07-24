@@ -54,14 +54,27 @@ public struct OWStreamOptions: Sendable {
     /// runs the function-calling loop (weather, MCP servers exposed as tools, …)
     /// and streams back the final answer with the tool results incorporated.
     public var toolIDs: [String]
+    /// Request Open WebUI's NATIVE function-calling mode for this turn, so a raw
+    /// model autonomously calls the tools bound to it (server-side `qwen3_xml`
+    /// parser) instead of relying on a prompt-based pipe. Sent as
+    /// `params.function_calling = "native"`.
+    public var nativeFunctionCalling: Bool
+    /// Whether the model may emit a `<think>` reasoning block. OFF sends
+    /// `chat_template_kwargs.enable_thinking = false` so a reasoning model answers
+    /// directly (faster, no thinking budget spent) — the same switch the title task
+    /// uses. Defaults ON.
+    public var enableThinking: Bool
     public init(temperature: Double? = nil, webSearch: Bool = false,
                 imageGeneration: Bool = false, codeInterpreter: Bool = false,
-                toolIDs: [String] = []) {
+                toolIDs: [String] = [], nativeFunctionCalling: Bool = false,
+                enableThinking: Bool = true) {
         self.temperature = temperature
         self.webSearch = webSearch
         self.imageGeneration = imageGeneration
         self.codeInterpreter = codeInterpreter
         self.toolIDs = toolIDs
+        self.nativeFunctionCalling = nativeFunctionCalling
+        self.enableThinking = enableThinking
     }
 
     var anyFeature: Bool { webSearch || imageGeneration || codeInterpreter }
@@ -159,7 +172,9 @@ public final class ChatCompletionsClient: @unchecked Sendable {
                     ? Body.Features(web_search: options.webSearch,
                                     image_generation: options.imageGeneration,
                                     code_interpreter: options.codeInterpreter)
-                    : nil)
+                    : nil,
+                 params: options.nativeFunctionCalling ? Body.Params(function_calling: "native") : nil,
+                 chat_template_kwargs: options.enableThinking ? nil : Body.ChatTemplateKwargs(enable_thinking: false))
         )
         return req
     }
@@ -172,6 +187,10 @@ public final class ChatCompletionsClient: @unchecked Sendable {
         var files: [OWAttachment]?
         var tool_ids: [String]?
         var features: Features?
+        var params: Params?
+        var chat_template_kwargs: ChatTemplateKwargs?
+        struct Params: Encodable { var function_calling: String? }
+        struct ChatTemplateKwargs: Encodable { var enable_thinking: Bool }
         // Only the enabled flags are sent (Open WebUI reads whichever are present).
         struct Features: Encodable {
             var web_search: Bool?

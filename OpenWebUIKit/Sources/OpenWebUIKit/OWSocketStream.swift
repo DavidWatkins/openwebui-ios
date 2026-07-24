@@ -101,6 +101,11 @@ extension OpenWebUIClient {
         if options.codeInterpreter { features["code_interpreter"] = true }
         if !features.isEmpty { body["features"] = features }
         if !options.toolIDs.isEmpty { body["tool_ids"] = options.toolIDs }
+        // Native function calling: the raw model autonomously calls its bound tools
+        // (web_search, weather) via the server-side qwen3_xml parser.
+        if options.nativeFunctionCalling { body["params"] = ["function_calling": "native"] }
+        // Thinking OFF → tell the chat template not to emit a <think> block.
+        if !options.enableThinking { body["chat_template_kwargs"] = ["enable_thinking": false] }
 
         var req = request("/api/chat/completions", method: "POST")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")

@@ -173,7 +173,13 @@ public actor OWSocket {
         }
     }
 
+    /// Dumps every raw socket frame to the console. Enable by setting the
+    /// `socket.debug` UserDefaults key (Settings → Developer). Used to capture the
+    /// exact events OWUI emits during native tool calling.
+    static var debugFrames: Bool { UserDefaults.standard.bool(forKey: "socket.debug") }
+
     private func decodeEvent(_ json: String) {
+        if Self.debugFrames { print("🔌 socket event: \(json.prefix(2000))") }
         guard let arr = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [Any],
               arr.count >= 2, (arr[0] as? String) == "events",
               let payload = arr[1] as? [String: Any] else { return }
@@ -195,12 +201,20 @@ public actor OWSocket {
             if let output = data["output"] as? [[String: Any]] {
                 var answer = "", think = ""
                 for block in output {
+                    let blockType = (block["type"] as? String) ?? ""
+                    // A native tool call is NOT reply text — skip it (its progress
+                    // arrives via the separate `status` events). Adding it to the
+                    // answer was corrupting/emptying the reply under native FC.
+                    if blockType == "function_call" || blockType == "tool_calls" { continue }
                     let joined = (block["content"] as? [[String: Any]])?
                         .compactMap { ($0["type"] as? String) == "output_text" ? $0["text"] as? String : nil }
                         .joined() ?? ""
-                    if (block["type"] as? String) == "reasoning" { think += joined }
+                    if blockType == "reasoning" { think += joined }
                     else { answer += joined }
                 }
+                // Fallback: some flows stream the answer as a plain `content` string
+                // (OpenAI-delta style) rather than typed output blocks.
+                if answer.isEmpty, let c = data["content"] as? String { answer = c }
                 // Defensive: if the answer still carries literal <think> tags
                 // (pipe re-attaches reasoning; some flows don't convert them),
                 // lift them into the reasoning channel instead of the reply.
