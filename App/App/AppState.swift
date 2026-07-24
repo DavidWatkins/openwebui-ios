@@ -136,7 +136,7 @@ final class AppState: ObservableObject {
             let facts = await client.extractMemories(model: model, userText: userText,
                                                      replyText: replyText, existing: memories.map(\.content))
             guard !facts.isEmpty else { return }
-            for f in facts { try? await client.addMemory(f) }
+            for f in facts { _ = try? await client.addMemory(f) }
             await loadMemories()
         }
     }
@@ -217,14 +217,20 @@ final class AppState: ObservableObject {
     }
 
     /// Model id used as the default for new chats. Priority: the user's explicit
-    /// preferred model → the server-side "Agent (tools)" pipe (contextual web
-    /// search, weather, …) when present → the first available model.
+    /// preferred model → the first raw (non-pipe, non-arena) model → the first
+    /// available model. Pipes like "Agent (tools)" and "Arena Model" are opt-in —
+    /// new chats shouldn't silently route through them.
     var defaultModel: String? {
         if let id = preferredModelID, models.contains(where: { $0.id == id }) { return id }
-        if let agent = models.first(where: { $0.id.hasSuffix(".agent") || $0.name == "Agent (tools)" }) {
-            return agent.id
-        }
+        if let raw = models.first(where: { !isPipeModel($0) }) { return raw.id }
         return models.first?.id
+    }
+
+    /// A server-side pipe / meta model (Agent tools, Arena, …) rather than a plain LLM.
+    private func isPipeModel(_ m: OWModel) -> Bool {
+        let id = m.id.lowercased(), name = m.name.lowercased()
+        return id.hasPrefix("agent") || id.hasSuffix(".agent") || id.contains("arena")
+            || name.contains("agent") || name.contains("arena")
     }
 
     func updateServer(_ url: URL) {

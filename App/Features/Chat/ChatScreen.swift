@@ -21,6 +21,7 @@ struct ChatScreen: View {
     @State private var webURL = ""
     @State private var comingSoon: String?
     @State private var showVoice = false
+    @State private var showTools = false
 
     init(app: AppState, chat: OWChatSummary?, mode: ChatMode? = nil, onChanged: @escaping () -> Void) {
         let model = app.makeChatViewModel(chat: chat, mode: mode)
@@ -108,7 +109,10 @@ struct ChatScreen: View {
     private var modelMenu: some View {
         Menu {
             ForEach(app.models) { m in
-                Button { vm.selectModel(m.id) } label: {
+                Button {
+                    vm.selectModel(m.id)
+                    app.preferredModelID = m.id   // remember it as the default for new chats
+                } label: {
                     if vm.selectedModel == m.id {
                         Label(m.shortName, systemImage: "checkmark")
                     } else {
@@ -147,6 +151,7 @@ struct ChatScreen: View {
                             // Tool activity ("🔧 web_search: …") shows inline under this
                             // reply while it runs — only on the message being generated.
                             toolStatus: streaming ? vm.toolStatus : nil,
+                            tokPerSec: msg.role == .assistant ? vm.genRate[msg.id] : nil,
                             onEdit: msg.role == .user ? { vm.editUser(messageID: msg.id, newText: $0) } : nil,
                             onRegenerate: msg.role == .assistant ? { vm.regenerate(messageID: msg.id) } : nil,
                             onRetryModel: msg.role == .assistant ? { vm.regenerate(messageID: msg.id, model: $0) } : nil,
@@ -191,7 +196,6 @@ struct ChatScreen: View {
             HStack(spacing: 8) {
                 featuresMenu
                 toggleChip(system: "photo.artframe", label: "Gerar imagem", on: $vm.imageMode)
-                if !app.tools.isEmpty { toolChip }
                 Spacer()
             }
             .padding(.horizontal, 12)
@@ -210,6 +214,20 @@ struct ChatScreen: View {
                     .font(.ody(.body, design: .monospaced))
                     .foregroundStyle(theme.fg)
                     .focused($inputFocused)
+                    #if os(macOS)
+                    // Return sends (same guard as the send button); Shift-Return
+                    // and Option-Return (native) insert a line break instead.
+                    .onSubmit {
+                        guard !vm.isStreaming, canSend else { return }
+                        submitComposer()
+                        inputFocused = true   // keep typing without re-clicking
+                    }
+                    .onKeyPress(.return, phases: .down) { press in
+                        guard press.modifiers.contains(.shift) else { return .ignored }
+                        vm.input += "\n"
+                        return .handled
+                    }
+                    #endif
                     .lineLimit(1...6)
                     .padding(.horizontal, 14).padding(.vertical, 10)
                     .background(theme.panel, in: RoundedRectangle(cornerRadius: 18))
@@ -239,13 +257,17 @@ struct ChatScreen: View {
         #endif
         .sheet(isPresented: $showNotePicker) {
             NotePickerSheet(client: app.client) { note in Task { await vm.attachNote(note) } }
+                .macSheetFrame()
         }
         .sheet(isPresented: $showChatPicker) {
             ChatPickerSheet(client: app.client) { c in Task { await vm.attachChatReference(c) } }
+                .macSheetFrame()
         }
         .sheet(isPresented: $showKBPicker) {
             KBPickerSheet(client: app.client) { kb in vm.attachKnowledge(kb) }
+                .macSheetFrame()
         }
+        .sheet(isPresented: $showTools) { toolsSheet.macSheetFrame(440, 480) }
         .alert("Anexar Página Web", isPresented: $showWebInput) {
             TextField("https://…", text: $webURL)
                 .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
@@ -394,55 +416,79 @@ struct ChatScreen: View {
                 .frame(width: 42, height: 42)
                 .background((canSend || vm.isStreaming || voice.isRecording) ? theme.accent : theme.border, in: Circle())
         }
+        #if os(macOS)
+        .keyboardShortcut(.return, modifiers: .command)   // ⌘↩ sends from anywhere
+        #endif
         .disabled(!voice.isRecording && !vm.isStreaming && !canSend)
     }
 
-    /// Open WebUI per-turn feature flags (web search / image generation / code
-    /// interpreter), consolidated into one chip-styled menu.
+    /// Composer chip that opens the Tools sheet. Accented when any tool is on;
+    /// shows the count so you can see at a glance how many are active.
     private var featuresMenu: some View {
-        let active = vm.webSearch || vm.imageGeneration || vm.codeInterpreter
-        return Menu {
-            Toggle(isOn: $vm.webSearch) { Label("Buscar na web", systemImage: "globe") }
-            Toggle(isOn: $vm.imageGeneration) { Label("Ilustrar resposta", systemImage: "photo") }
-            Toggle(isOn: $vm.codeInterpreter) { Label("Executar código", systemImage: "chevron.left.forwardslash.chevron.right") }
-        } label: {
+        let count = [vm.searchTool, vm.weatherTool, vm.codeInterpreter, vm.imageGeneration].filter { $0 }.count
+        return Button { showTools = true } label: {
             HStack(spacing: 5) {
-                Image(systemName: "sparkles").font(.ody(size: 11))
-                Text("Recursos").font(.ody(size: 12, design: .monospaced))
+                Image(systemName: "wrench.and.screwdriver").font(.ody(size: 11))
+                Text("Ferramentas").font(.ody(size: 12, design: .monospaced))
+                if count > 0 { Text(verbatim: "\(count)").font(.ody(size: 11, design: .monospaced)) }
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
-            .foregroundStyle(active ? .white : theme.secondaryText)
-            .background(active ? theme.accent : theme.panel, in: Capsule())
-            .overlay(Capsule().stroke(theme.border, lineWidth: active ? 0 : 1))
+            .foregroundStyle(count > 0 ? .white : theme.secondaryText)
+            .background(count > 0 ? theme.accent : theme.panel, in: Capsule())
+            .overlay(Capsule().stroke(theme.border, lineWidth: count > 0 ? 0 : 1))
         }
         .buttonStyle(.plain)
     }
 
-    /// Enable/disable server tools (weather, MCP, …) for the next reply. Multi-
-    /// select menu styled like the toggle chips; accented when any are on.
-    private var toolChip: some View {
-        let active = !vm.selectedToolIDs.isEmpty
-        return Menu {
-            ForEach(app.tools) { t in
-                Button {
-                    if vm.selectedToolIDs.contains(t.id) { vm.selectedToolIDs.remove(t.id) }
-                    else { vm.selectedToolIDs.insert(t.id) }
-                } label: {
-                    Label(t.name, systemImage: vm.selectedToolIDs.contains(t.id) ? "checkmark" : "wrench.and.screwdriver")
+    /// Claude-style tool picker: one labeled toggle row per tool, in a sheet.
+    /// Web search + weather run client-side (agent loop); code + illustrate are
+    /// server-backed. Each is independent.
+    private var toolsSheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Ferramentas").font(.ody(size: 17, design: .monospaced)).foregroundStyle(theme.fg)
+                Spacer()
+                Button { showTools = false } label: {
+                    Text("Concluir").font(.ody(size: 15, design: .monospaced)).foregroundStyle(theme.accent)
                 }
+                .buttonStyle(.plain)
             }
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "wrench.and.screwdriver").font(.ody(size: 11))
-                Text("Ferramentas").font(.ody(size: 12, design: .monospaced))
-                if active { Text(verbatim: "\(vm.selectedToolIDs.count)").font(.ody(size: 11, design: .monospaced)) }
+            .padding()
+            Divider().overlay(theme.border)
+            ScrollView {
+                VStack(spacing: 10) {
+                    toolRow("globe", .blue, "Buscar na web",
+                            "Resultados da web ao vivo.", $vm.searchTool)
+                    toolRow("cloud.sun.fill", .orange, "Clima",
+                            "Condições atuais (Open-Meteo).", $vm.weatherTool)
+                    toolRow("chevron.left.forwardslash.chevron.right", .green, "Executar código",
+                            "Interpretador de código no servidor.", $vm.codeInterpreter)
+                    toolRow("photo", .purple, "Ilustrar resposta",
+                            "Gera uma imagem a partir da resposta.", $vm.imageGeneration)
+                    Divider().overlay(theme.border).padding(.vertical, 2)
+                    toolRow("brain", .pink, "Pensar",
+                            "Deixe o modelo raciocinar antes de responder.", $vm.thinkingEnabled)
+                }
+                .padding()
             }
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .foregroundStyle(active ? .white : theme.secondaryText)
-            .background(active ? theme.accent : theme.panel, in: Capsule())
-            .overlay(Capsule().stroke(theme.border, lineWidth: active ? 0 : 1))
         }
-        .buttonStyle(.plain)
+        .background(theme.bg)
+        .presentationDetents([.medium, .large])
+    }
+
+    private func toolRow(_ icon: String, _ tint: Color, _ title: LocalizedStringKey,
+                         _ subtitle: LocalizedStringKey, _ on: Binding<Bool>) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon).font(.system(size: 16)).foregroundStyle(tint).frame(width: 26)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.ody(size: 15, design: .monospaced)).foregroundStyle(theme.fg)
+                Text(subtitle).font(.ody(size: 11)).foregroundStyle(theme.secondaryText)
+            }
+            Spacer()
+            Toggle("", isOn: on).labelsHidden().tint(theme.accent)
+        }
+        .padding(12)
+        .background(theme.panel, in: RoundedRectangle(cornerRadius: 14))
     }
 
     private func toggleChip(system: String, label: String, on: Binding<Bool>) -> some View {

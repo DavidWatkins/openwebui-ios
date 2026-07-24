@@ -19,20 +19,48 @@ final class ChatViewModel: ObservableObject {
     /// Documents staged for the next message (uploaded → RAG).
     @Published var pendingDocuments: [OWAttachment] = []
     @Published var uploading = false
-    /// Composer toggle: web search for the next reply.
-    @Published var webSearch = false
+    /// Composer tool toggles: independent client-side tools run via the agent loop
+    /// (prompt-based tool calling on a raw model — no server pipe, no native FC).
+    /// Each is a real tool the model can choose to call. Persisted so a chosen set
+    /// stays on by default across chats + launches (Claude-style).
+    @Published var searchTool = UserDefaults.standard.bool(forKey: "tool.search") {
+        didSet { UserDefaults.standard.set(searchTool, forKey: "tool.search") }
+    }
+    @Published var weatherTool = UserDefaults.standard.bool(forKey: "tool.weather") {
+        didSet { UserDefaults.standard.set(weatherTool, forKey: "tool.weather") }
+    }
     /// Composer toggle: the next prompt generates an image (server image engine)
-    /// instead of a chat reply. Mutually exclusive with webSearch.
-    @Published var imageMode = false { didSet { if imageMode { webSearch = false } } }
-    /// Server tool/function ids enabled for the next reply (weather, MCP, …).
-    /// Open WebUI runs the function-calling loop server-side when these are set.
+    /// instead of a chat reply.
+    @Published var imageMode = false
+    /// Server tool/function ids enabled for the next reply. Retained for the socket
+    /// path's plumbing; no UI selects them now that tools run client-side.
     @Published var selectedToolIDs: Set<String> = []
+    /// Any client-side agent tool on → route the turn through the agent loop.
+    var agentToolsOn: Bool { searchTool || weatherTool }
+    /// The enabled client-side tools, as the ids the tool doc / parser use.
+    var enabledAgentTools: [String] {
+        (searchTool ? ["web_search"] : []) + (weatherTool ? ["weather"] : [])
+    }
     /// Live tool-progress line from the socket flow (e.g. "🔧 weather: Boston").
     @Published var toolStatus: String?
     /// Open WebUI per-turn feature flags (server generates an image from the reply /
     /// runs code). Distinct from `imageMode`, which is the manual image composer.
-    @Published var imageGeneration = false
-    @Published var codeInterpreter = false
+    /// Persisted alongside the client tools so the chosen set is the default.
+    @Published var imageGeneration = UserDefaults.standard.bool(forKey: "tool.image") {
+        didSet { UserDefaults.standard.set(imageGeneration, forKey: "tool.image") }
+    }
+    @Published var codeInterpreter = UserDefaults.standard.bool(forKey: "tool.code") {
+        didSet { UserDefaults.standard.set(codeInterpreter, forKey: "tool.code") }
+    }
+    /// Whether the model may think (emit a `<think>` block). OFF → answer directly.
+    /// Persisted; defaults ON (nil-coalesced so a fresh install starts with thinking).
+    @Published var thinkingEnabled = (UserDefaults.standard.object(forKey: "tool.thinking") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(thinkingEnabled, forKey: "tool.thinking") }
+    }
+    /// Generation speed (tokens/sec) per assistant message id, measured while it
+    /// streamed. Only set when a reply actually streamed over time (not for a
+    /// buffered pipe reply that arrives all at once).
+    @Published var genRate: [String: Double] = [:]
 
     let models: [OWModel]
 
@@ -105,6 +133,13 @@ final class ChatViewModel: ObservableObject {
     }
 
     func selectModel(_ id: String) { selectedModel = id }
+
+    /// A raw LLM (not a server-side pipe like the Agent tools or Arena). Raw models
+    /// get native function calling so they can autonomously call their bound tools.
+    static func isRawModel(_ id: String) -> Bool {
+        let l = id.lowercased()
+        return !l.hasPrefix("agent") && !l.hasSuffix(".agent") && !l.contains("arena")
+    }
 
     // MARK: - History
 
@@ -276,9 +311,11 @@ final class ChatViewModel: ObservableObject {
         // Ambient context (date/time, location, custom instructions) goes first.
         if let ctx = contextProvider?() { convo.insert(ctx, at: 0) }
         let files = messages.last(where: { $0.role == .user })?.documents ?? []
-        // Server chats stream token-by-token over the socket; local/temporary chats
-        // use the buffered SSE path.
-        if mode == .server {
+        // Tools on a raw model → run the client-side agent loop (prompt-based tool
+        // calling, no server pipe / native FC). Otherwise a normal turn.
+        if agentToolsOn, Self.isRawModel(model) {
+            streamTask = Task { await self.runAgentTurn(model: model, convo: convo, assistantID: assistantID) }
+        } else if mode == .server {
             streamTask = Task { await self.runSocketTurn(model: model, convo: convo, files: files, assistant: assistant) }
         } else {
             streamTask = Task { await self.runStream(model: model, convo: convo, files: files, assistantID: assistantID) }
@@ -311,8 +348,16 @@ final class ChatViewModel: ObservableObject {
         defer { endBackgroundHold() }
 
         var sawContent = false
-        let options = OWStreamOptions(webSearch: webSearch, imageGeneration: imageGeneration,
-                                      codeInterpreter: codeInterpreter, toolIDs: Array(selectedToolIDs))
+        // Live tok/s: clock starts at the first token (reasoning or content) and the
+        // rate counts reasoning + answer, updated each cumulative frame.
+        var genStart: Date?
+        func tick() {
+            guard let s = genStart, let i = index(of: assistant.id) else { return }
+            tickRate(assistant.id, chars: messages[i].content.count + (messages[i].reasoning?.count ?? 0), start: s)
+        }
+        let options = OWStreamOptions(webSearch: false, imageGeneration: imageGeneration,
+                                      codeInterpreter: codeInterpreter, toolIDs: Array(selectedToolIDs),
+                                      enableThinking: thinkingEnabled)
         for await update in client.socketStream(chatID: chatID, messageID: assistant.id,
                                                 model: model, messages: convo, files: files, options: options) {
             if Task.isCancelled { break }
@@ -321,8 +366,12 @@ final class ChatViewModel: ObservableObject {
                 sawContent = true
                 toolStatus = nil                 // answer is arriving → tools are done
                 setContent(assistant.id, full)   // cumulative → replace, not append
+                if genStart == nil { genStart = Date() }
+                tick()
             case .reasoning(let full):
                 setReasoning(assistant.id, full) // cumulative → replace, not append
+                if genStart == nil { genStart = Date() }
+                tick()
             case .toolUse(let t):
                 toolStatus = nil                 // the run finished → drop the spinner
                 addToolUse(assistant.id, t)
@@ -336,25 +385,36 @@ final class ChatViewModel: ObservableObject {
                 else { self.error = m }
             }
         }
-        toolStatus = nil
-        // A buffered pipe reply can outlast the socket (it sends nothing for a
-        // minute, then the whole reply). If we caught no content over the socket,
-        // the answer is still persisted server-side — pull it back so it isn't lost.
-        if !sawContent, !Task.isCancelled,
-           let server = try? await client.chat(chatID),
-           let node = server.allMessages.first(where: { $0.id == assistant.id }),
-           !node.content.isEmpty {
-            setContent(assistant.id, node.content)
-            if let r = node.reasoning { setReasoning(assistant.id, r) }
-            sawContent = true
+        // A buffered pipe reply (the Agent) runs its whole tool + reasoning loop
+        // server-side and writes the answer only at the very end — often AFTER the
+        // socket stream has already closed. If we caught no content, the reply is
+        // still being written server-side; poll for it briefly instead of giving up
+        // (a single immediate re-fetch usually lands before the pipe finishes).
+        if !sawContent, !Task.isCancelled {
+            toolStatus = L("Finalizando resposta…")
+            for _ in 0..<16 {                       // ~24s at 1.5s intervals
+                if Task.isCancelled { break }
+                if let server = try? await client.chat(chatID),
+                   let node = server.allMessages.first(where: { $0.id == assistant.id }),
+                   !node.content.isEmpty {
+                    setContent(assistant.id, node.content)
+                    if let r = node.reasoning { setReasoning(assistant.id, r) }
+                    sawContent = true
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
         }
+        toolStatus = nil
         isStreaming = false
         if !sawContent, let i = index(of: assistant.id), messages[i].content.isEmpty {
             messages[i].content = L("_(sem resposta)_")
         }
         notifyReplyIfBackgrounded(assistant.id)
-        // The socket flow already persisted the reply server-side; just refresh.
-        onChanged?()
+        // OWUI stores a socket reply with an empty `content` (the text lives in its
+        // `output` block), so on reload it comes back blank. Re-write the tree with
+        // the streamed text folded in so the reply survives a refetch.
+        if sawContent { await persist() } else { onChanged?() }
         if sawContent, let reply = messages.first(where: { $0.id == assistant.id })?.content {
             let lastUser = messages.last { $0.role == .user }?.content ?? ""
             onReplyComplete?(lastUser, reply)
@@ -407,18 +467,26 @@ final class ChatViewModel: ObservableObject {
     private func runStream(model: String, convo: [OWChatMessageInput],
                            files: [OWAttachment], assistantID: String) async {
         var sawText = false
+        var genStart: Date?, genChars = 0
         do {
             for try await update in completions.stream(model: model, messages: convo, files: files,
-                                                       options: OWStreamOptions(webSearch: webSearch,
+                                                       options: OWStreamOptions(webSearch: false,
                                                                                 imageGeneration: imageGeneration,
                                                                                 codeInterpreter: codeInterpreter,
-                                                                                toolIDs: Array(selectedToolIDs))) {
+                                                                                toolIDs: Array(selectedToolIDs),
+                                                                                enableThinking: thinkingEnabled)) {
                 switch update {
                 case .textDelta(let d):
                     sawText = true
+                    if genStart == nil { genStart = Date() }
+                    genChars += d.count
                     append(assistantID, d)
+                    if let s = genStart { tickRate(assistantID, chars: genChars, start: s) }
                 case .reasoningDelta(let d):
+                    if genStart == nil { genStart = Date() }
+                    genChars += d.count
                     appendReasoning(assistantID, d)
+                    if let s = genStart { tickRate(assistantID, chars: genChars, start: s) }
                 case .error(let msg):
                     setContent(assistantID, friendlyError(msg))
                 case .done:
@@ -440,6 +508,138 @@ final class ChatViewModel: ObservableObject {
         }
         isStreaming = false
         await persist()
+    }
+
+    // MARK: - Client-side agent loop (tools without a server pipe)
+
+    /// Prompt-based tool calling run entirely on the client: give a raw model a
+    /// tool doc, let it emit a JSON tool call, run the tool here (web search via
+    /// Open WebUI's search API, weather via Open-Meteo), feed the result back, and
+    /// loop until it answers. Mirrors the server pipe's logic but needs no pipe and
+    /// no native function calling (which is unreliable on some models).
+    private func runAgentTurn(model: String, convo baseConvo: [OWChatMessageInput], assistantID: String) async {
+        let tools = enabledAgentTools
+        var convo: [OWChatMessageInput] = [OWChatMessageInput(role: "system", text: Self.toolDoc(for: tools))] + baseConvo
+        var reasonings: [String] = []
+        var genStart: Date?, genChars = 0
+        let maxIterations = 5
+
+        do {
+            for _ in 0..<maxIterations {
+                if Task.isCancelled { break }
+                var step = "", stepReason = ""
+                var streamingAnswer = false   // once we know it's prose, stream live
+
+                for try await update in completions.stream(model: model, messages: convo, files: [],
+                                                           options: OWStreamOptions(temperature: nil,
+                                                                                    enableThinking: thinkingEnabled)) {
+                    if Task.isCancelled { break }
+                    switch update {
+                    case .textDelta(let d):
+                        step += d
+                        // Decide once, early: a tool call starts with `{`; anything
+                        // else is the final answer → stream it into the bubble live.
+                        if !streamingAnswer, !step.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
+                           !step.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            streamingAnswer = true
+                        }
+                        if streamingAnswer {
+                            toolStatus = nil; setContent(assistantID, step)
+                            if genStart == nil { genStart = Date() }
+                            genChars += d.count
+                            if let s = genStart { tickRate(assistantID, chars: genChars, start: s) }
+                        } else { toolStatus = L("Pensando…") }
+                    case .reasoningDelta(let d):
+                        stepReason += d; setReasoning(assistantID, stepReason)
+                        if genStart == nil { genStart = Date() }
+                        genChars += d.count
+                        if let s = genStart { tickRate(assistantID, chars: genChars, start: s) }
+                    case .error(let msg):
+                        setContent(assistantID, friendlyError(msg)); toolStatus = nil; isStreaming = false
+                        await persist(); return
+                    case .done: break
+                    }
+                }
+                if !stepReason.isEmpty { reasonings.append(stepReason) }
+
+                guard let call = Self.parseToolCall(step), tools.contains(call.tool) else {
+                    // No (enabled) tool call → `step` is the final answer (streamed).
+                    break
+                }
+                // Run the tool, show a card, feed the result back, loop.
+                toolStatus = "🔧 \(call.tool): \(call.argument)"
+                let result = await runTool(call)
+                addToolUse(assistantID, OWToolUse(action: call.tool == "weather" ? "weather" : "web_search",
+                                                  query: call.argument, results: result.text, sources: result.sources))
+                convo.append(OWChatMessageInput(role: "assistant", text: step))
+                convo.append(OWChatMessageInput(role: "user",
+                    text: "Tool result:\n\(result.text)\n\nUsing this, answer my previous question directly. Do not output JSON or call another tool unless truly necessary."))
+                setContent(assistantID, "")   // clear any stray partial before the next step
+            }
+        } catch is CancellationError {
+        } catch {
+            let msg = friendlyError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            if let i = index(of: assistantID), messages[i].content.isEmpty { messages[i].content = "⚠️ \(msg)" }
+            else { self.error = msg }
+        }
+
+        toolStatus = nil
+        isStreaming = false
+        // Combine the thinking from every step (tool-deciding + answer) for the
+        // reasoning disclosure, so the whole chain is auditable.
+        if !reasonings.isEmpty { setReasoning(assistantID, reasonings.joined(separator: "\n\n---\n\n")) }
+        if let i = index(of: assistantID), messages[i].content.isEmpty {
+            messages[i].content = L("_(sem resposta)_")
+        }
+        let isNew = isNewChat
+        await persist()
+        if let reply = messages.first(where: { $0.id == assistantID })?.content, !reply.isEmpty {
+            onReplyComplete?(messages.last { $0.role == .user }?.content ?? "", reply)
+        }
+        if isNew { await autoTitle(assistantID: assistantID) }
+    }
+
+    /// Executes one parsed tool call.
+    private func runTool(_ call: (tool: String, argument: String)) async -> OWToolResult {
+        switch call.tool {
+        case "weather": return await runWeatherTool(location: call.argument)
+        default:        return await client.runWebSearchTool(query: call.argument)
+        }
+    }
+
+    /// Parses a `{"tool":"web_search","query":"…"}` / `{"tool":"weather","location":"…"}`
+    /// call out of the model's reply. Returns nil when the reply is a direct answer.
+    static func parseToolCall(_ text: String) -> (tool: String, argument: String)? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let start = t.firstIndex(of: "{"), let end = t.lastIndex(of: "}") else { return nil }
+        let json = String(t[start...end])
+        guard let obj = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any],
+              let tool = obj["tool"] as? String else { return nil }
+        let arg = (obj["query"] as? String) ?? (obj["location"] as? String) ?? ""
+        guard tool == "web_search" || tool == "weather" else { return nil }
+        return (tool, arg)
+    }
+
+    /// The tool doc handed to the model — mirrors the server pipe's contract, but
+    /// only advertises the tools the user actually enabled (each is independent).
+    static func toolDoc(for tools: [String]) -> String {
+        var calls: [String] = [], rules: [String] = []
+        if tools.contains("web_search") {
+            calls.append(#"- Web search: {"tool": "web_search", "query": "<search terms>"}"#)
+            rules.append("- For current events, news, recent releases, prices, or verifying a fact → ALWAYS call web_search first.")
+        }
+        if tools.contains("weather") {
+            calls.append(#"- Weather:    {"tool": "weather", "location": "<place>"}"#)
+            rules.append("- For weather/temperature/forecast anywhere → call weather. You DO have live weather; never say you can't.")
+        }
+        rules.append("- Use ONE tool at a time. After you get a tool result, answer the user's question directly in prose — do NOT output JSON again unless you truly need another tool.")
+        rules.append("- For general knowledge, coding, math, or creative writing, just answer directly (no tool).")
+        return """
+        You have live tools and MUST use them for anything current, real-time, or fact-based you're unsure of. To call a tool, reply with ONLY a JSON object and nothing else:
+        \(calls.joined(separator: "\n"))
+        Rules:
+        \(rules.joined(separator: "\n"))
+        """
     }
 
     /// Map raw server errors to clearer pt-BR messages.
@@ -687,6 +887,13 @@ final class ChatViewModel: ObservableObject {
     /// Cumulative reasoning (socket sends the full thinking each tick → replace).
     private func setReasoning(_ id: String, _ text: String) {
         if let i = index(of: id) { messages[i].reasoning = text }
+    }
+    /// Live tokens/sec (~4 chars/token) counting reasoning + answer, updated as it
+    /// streams so the header shows a running rate. `chars` is the cumulative
+    /// generated length; `start` the first token's timestamp.
+    private func tickRate(_ id: String, chars: Int, start: Date) {
+        let dt = Date().timeIntervalSince(start)
+        if dt >= 0.3, chars > 0 { genRate[id] = (Double(chars) / 4.0) / dt }
     }
     /// Append a completed tool run so the auditable card appears live. Native OWUI
     /// web-search sources arrive one-per-event (no query) — merge those into a

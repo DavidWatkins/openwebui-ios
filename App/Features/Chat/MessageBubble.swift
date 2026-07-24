@@ -15,6 +15,8 @@ struct MessageBubble: View {
     var models: [OWModel] = []
     /// Live tool activity for the message being generated ("🔧 web_search: …").
     var toolStatus: String? = nil
+    /// Measured generation speed (tokens/sec), shown in the header when present.
+    var tokPerSec: Double? = nil
     var onEdit: ((String) -> Void)? = nil          // edited user text
     var onRegenerate: (() -> Void)? = nil
     var onRetryModel: ((String) -> Void)? = nil    // model id
@@ -27,6 +29,9 @@ struct MessageBubble: View {
     /// nil = follow the automatic behaviour (open while thinking, closed once the
     /// reply starts). Once the user taps, their choice wins for the rest of the view.
     @State private var reasoningOverride: Bool?
+    /// User preference: keep the reasoning disclosure open once thinking is done
+    /// (default is to collapse it). Set in Settings.
+    @AppStorage("reasoning.expandedByDefault") private var reasoningExpandedByDefault = false
 
     struct ViewerImage: Identifiable { let id = UUID(); let url: String }
 
@@ -59,7 +64,7 @@ struct MessageBubble: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .transition(.opacity)
     }
-    private var reasoningExpanded: Bool { reasoningOverride ?? isThinking }
+    private var reasoningExpanded: Bool { reasoningOverride ?? (isThinking || reasoningExpandedByDefault) }
 
     var body: some View {
         HStack(alignment: .top) {
@@ -174,6 +179,11 @@ struct MessageBubble: View {
             Text(message.model?.split(separator: "/").last.map(String.init) ?? "Open WebUI")
                 .font(.ody(size: 11, design: .monospaced))
                 .foregroundStyle(theme.secondaryText)
+            if let tps = tokPerSec, tps > 0 {
+                Text("· \(Int(tps.rounded())) tok/s")
+                    .font(.ody(size: 10, design: .monospaced))
+                    .foregroundStyle(theme.secondaryText.opacity(0.8))
+            }
             if !message.content.isEmpty {
                 Button { speech.toggle(message.content, id: message.id) } label: {
                     if speech.isPreparing(message.id) {
