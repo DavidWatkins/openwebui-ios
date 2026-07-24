@@ -82,20 +82,20 @@ struct LoginView: View {
             if let err = app.loginError {
                 Text(err)
                     .font(.ody(.footnote, design: .monospaced))
-                    .foregroundStyle(theme.accent)
+                    .foregroundStyle(theme.danger)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Button(action: submit) {
                 HStack {
-                    if app.loggingIn { ProgressView().tint(.white) }
+                    if app.loggingIn { ProgressView().tint(theme.onAccent) }
                     Text("Entrar").font(.ody(.headline, design: .monospaced))
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
                 .background(theme.accent, in: RoundedRectangle(cornerRadius: 12))
-                .foregroundStyle(.white)
+                .foregroundStyle(theme.onAccent)
             }
             #if os(macOS)
             .keyboardShortcut(.defaultAction)

@@ -93,6 +93,11 @@ struct MessageBubble: View {
             }
             if !isUser { Spacer(minLength: 36) }
         }
+        // `.contain` (not `.combine`): VoiceOver treats the whole message as one
+        // navigable group while keeping the interactive children — branch ‹›,
+        // copy, regenerate and the retry Menu — individually reachable.
+        // `.combine` flattened the retry Menu out of existence.
+        .accessibilityElement(children: .contain)
         .fullScreenCover(item: $viewer) { v in ImageViewerView(url: v.url, client: client) }
     }
 
@@ -111,6 +116,7 @@ struct MessageBubble: View {
                         Image(systemName: "arrow.clockwise").actionHitTarget()
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(Text("Regenerar"))
                 }
                 if !isUser, !models.isEmpty, let onRetryModel {
                     Menu {
@@ -118,6 +124,7 @@ struct MessageBubble: View {
                     } label: {
                         Image(systemName: "arrow.triangle.2.circlepath").actionHitTarget()
                     }
+                    .accessibilityLabel(Text("Repetir com outro modelo"))
                 }
             }
             .font(.ody(size: 12))
@@ -146,11 +153,13 @@ struct MessageBubble: View {
                 Image(systemName: "chevron.left").actionHitTarget()
             }
             .buttonStyle(.plain).disabled(b.index <= 1)
+            .accessibilityLabel(Text("Versão anterior"))
             Text("\(b.index)/\(b.total)").font(.ody(size: 11, design: .monospaced))
             Button { branchTap += 1; onBranch?(1) } label: {
                 Image(systemName: "chevron.right").actionHitTarget()
             }
             .buttonStyle(.plain).disabled(b.index >= b.total)
+            .accessibilityLabel(Text("Próxima versão"))
         }
         .sensoryFeedback(.selection, trigger: branchTap)
     }
@@ -218,6 +227,7 @@ struct MessageBubble: View {
                     }
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(Text(speech.isSpeaking(message.id) ? "Parar leitura" : "Ler em voz alta"))
             }
         }
     }
@@ -380,6 +390,7 @@ struct CopyButton: View {
                 .actionHitTarget()
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(Text("Copiar"))
         .sensoryFeedback(.impact(weight: .light), trigger: copyTap)
     }
 }

@@ -235,3 +235,21 @@
 "Limpar tudo" = "Clear all";
 "Finalizando resposta…" = "Finishing reply…";
 "Ferramentas (busca e clima)" = "Tools (search & weather)";
+
+/* Accessibility (VoiceOver) labels + error banner */
+"Menu" = "Menu";
+"Conversa por voz" = "Voice conversation";
+"Escolher modelo" = "Choose model";
+"Ditar mensagem" = "Dictate message";
+"Parar ditado" = "Stop dictation";
+"Enviar mensagem" = "Send message";
+"Parar resposta" = "Stop response";
+"Remover anexo" = "Remove attachment";
+"Ativa ferramentas como busca na web e código" = "Enables tools like web search and code";
+"Repetir com outro modelo" = "Retry with another model";
+"Versão anterior" = "Previous version";
+"Próxima versão" = "Next version";
+"Ler em voz alta" = "Read aloud";
+"Parar leitura" = "Stop reading";
+"Salvar imagem" = "Save image";
+"Dispensar erro" = "Dismiss error";

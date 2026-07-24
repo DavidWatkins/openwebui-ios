@@ -340,13 +340,13 @@ struct ImageGenView: View {
             Task { await store.generate() }
         } label: {
             HStack {
-                if store.generating { ProgressView().tint(.white) }
+                if store.generating { ProgressView().tint(theme.onAccent) }
                 Text(LocalizedStringKey(store.generating ? "Gerando…" : "Gerar imagem"))
                     .font(.ody(.headline, design: .monospaced))
                 Image(systemName: "sparkles")
             }
             .frame(maxWidth: .infinity).padding(.vertical, 14)
-            .background(theme.accent, in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white)
+            .background(theme.accent, in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(theme.onAccent)
         }
         .disabled(store.generating || store.prompt.trimmingCharacters(in: .whitespaces).isEmpty)
         .opacity(store.generating || store.prompt.trimmingCharacters(in: .whitespaces).isEmpty ? 0.6 : 1)

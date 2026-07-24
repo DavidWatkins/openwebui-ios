@@ -23,6 +23,10 @@ struct OpenWebUIApp: App {
                 .environment(\.layoutDirection, lang.layoutDirection)   // RTL for ar/fa/ur/ps
                 .preferredColorScheme(themes.theme.isDark ? .dark : .light)
                 .tint(themes.theme.accent)
+                // Dynamic Type is honored up to XXL; the accessibility sizes
+                // would overflow the composer/chips/toolbars. Appearance
+                // .scaledSize applies the same clamp to point-sized fonts.
+                .dynamicTypeSize(...DynamicTypeSize.xxLarge)
                 // Keyed on the language code so a language switch rebuilds the
                 // tree and re-resolves every `L(_:)`-computed string (those read a
                 // global bundle SwiftUI can't observe). Language changes are rare
