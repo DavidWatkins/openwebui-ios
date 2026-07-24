@@ -724,6 +724,8 @@ final class ChatViewModel: ObservableObject {
                                                      tree: Array(tree.values), currentId: currentLeafId)
             chatID = id; self.title = title
             syncLiveRegistration()   // now addressable by id → register the live stream
+            onChanged?()             // a brand-new chat exists server-side now → list it
+                                     // immediately, not only when its first reply lands
         }
         // Keep the offline cache in step with what we just wrote.
         if mode == .server, let id = chatID {

@@ -114,6 +114,12 @@ struct ChatListView: View {
             listPane
                 .navigationDestination(for: ChatRoute.self) { route in chatDetail(route) }
         }
+        // Returning to the list (pop to root) reloads it. `.task` only runs once,
+        // so a chat created while you were inside it — e.g. a brand-new chat, which
+        // isn't listed until its first reply — wouldn't otherwise appear on the way back.
+        .onChange(of: path) { _, newPath in
+            if newPath.isEmpty { Task { await store.load() } }
+        }
         #endif
     }
 
