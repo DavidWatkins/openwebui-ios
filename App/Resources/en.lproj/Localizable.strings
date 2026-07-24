@@ -112,6 +112,7 @@
 "Salvar" = "Save";
 "Salvar na galeria" = "Save to gallery";
 "Selecionar modelo" = "Select model";
+"Selecione uma conversa" = "Select a chat";
 "Sem título" = "Untitled";
 "Sensibilidade" = "Sensitivity";
 "Servidor" = "Server";
@@ -198,6 +199,16 @@
 "Recursos" = "Features";
 "Ilustrar resposta" = "Illustrate reply";
 "Executar código" = "Run code";
+"Clima" = "Weather";
+"Pensar" = "Thinking";
+"Raciocínio expandido" = "Reasoning expanded";
+"FERRAMENTAS PADRÃO" = "DEFAULT TOOLS";
+"Deixe o modelo raciocinar antes de responder." = "Let the model reason before answering.";
+"Concluir" = "Done";
+"Resultados da web ao vivo." = "Live web results.";
+"Condições atuais (Open-Meteo)." = "Current conditions (Open-Meteo).";
+"Interpretador de código no servidor." = "Server-side code interpreter.";
+"Gera uma imagem a partir da resposta." = "Generate an image from the reply.";
 "PERSONALIZAÇÃO" = "PERSONALIZATION";
 "Instruções personalizadas" = "Custom instructions";
 "Localização" = "Location";
@@ -215,3 +226,5 @@
 "Gerenciar memórias" = "Manage memories";
 "Nenhuma memória ainda. À medida que você conversa, o assistente lembra fatos duráveis sobre você aqui." = "No memories yet. As you chat, the assistant remembers durable facts about you here.";
 "Limpar tudo" = "Clear all";
+"Finalizando resposta…" = "Finishing reply…";
+"Ferramentas (busca e clima)" = "Tools (search & weather)";
