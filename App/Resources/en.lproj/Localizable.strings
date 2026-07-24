@@ -35,6 +35,12 @@
 "Conversa por voz" = "Voice conversation";
 "Conversa temporária" = "Temporary chat";
 "Conversas" = "Chats";
+"CONVERSAS" = "CHATS";
+"Hoje" = "Today";
+"Ontem" = "Yesterday";
+"Conversas arquivadas" = "Archived chats";
+"Nenhuma conversa arquivada." = "No archived chats.";
+"Restaurar" = "Restore";
 "Descreva a imagem…" = "Describe the image…";
 "Descreva sua ideia em palavras simples…" = "Describe your idea in simple words…";
 "ENDEREÇO DO SERVIDOR OPEN WEBUI" = "OPEN WEBUI SERVER ADDRESS";

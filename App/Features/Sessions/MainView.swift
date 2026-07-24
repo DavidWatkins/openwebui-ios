@@ -150,7 +150,9 @@ struct ChatListView: View {
             // Boot straight into a new chat (Claude iOS style); the list is one
             // back-swipe away (iOS) / stays put in the sidebar (macOS). Once per
             // session so returning here doesn't re-open.
-            if !didAutoOpen {
+            // Skip when a launch intent is pending — `routeLaunch()` opens that chat
+            // instead, and this would stack a second empty one on top of it.
+            if !didAutoOpen, launch.action == nil {
                 didAutoOpen = true
                 openRoute(.new(mode: app.preferredChatMode, token: UUID()))
             }
@@ -300,7 +302,8 @@ struct ChatListView: View {
     private func routeLaunch() {
         guard let a = launch.action, a == .newChat || a == .camera || a == .share else { return }
         openRoute(.new(mode: app.preferredChatMode, token: UUID()))
-        launch.consume()   // openCameraOnNewChat / pendingShare stay for ChatScreen
+        didAutoOpen = true   // this IS the boot chat → don't let the list auto-open a 2nd
+        launch.consume()     // openCameraOnNewChat / pendingShare stay for ChatScreen
     }
 
     private var emptyState: some View {

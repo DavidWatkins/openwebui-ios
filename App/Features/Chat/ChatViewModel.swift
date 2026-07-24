@@ -862,6 +862,12 @@ final class ChatViewModel: ObservableObject {
     func stop() {
         streamTask?.cancel()
         isStreaming = false
+        // Cancel the server-side generation too: the socket flow runs as a background
+        // task that would otherwise keep generating and overwrite the truncated reply
+        // on reload. (No-op for local/temporary chats or before the chat is saved.)
+        if mode == .server, let id = chatID {
+            Task { try? await client.stopChatTasks(id) }
+        }
     }
 
     /// Merge turns produced by a voice session into this chat, then persist per
