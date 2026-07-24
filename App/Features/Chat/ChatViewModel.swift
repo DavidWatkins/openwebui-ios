@@ -8,7 +8,7 @@ import UIKit
 final class ChatViewModel: ObservableObject {
     @Published var messages: [OWMessage] = []
     @Published var input: String = ""
-    @Published var isStreaming = false
+    @Published var isStreaming = false { didSet { syncLiveRegistration() } }
     @Published var isLoadingHistory = false
     @Published var error: String?
     @Published var selectedModel: String?
@@ -79,6 +79,15 @@ final class ChatViewModel: ObservableObject {
     /// Supplies the ambient-context system message (date/time, location, custom
     /// instructions) to prepend to each turn. Evaluated per-send so it stays live.
     var contextProvider: (() -> OWChatMessageInput?)?
+    /// Registers/unregisters this view model as the *live* one for its chat id while
+    /// a reply streams. AppState keeps the streaming VM alive and keyed by id, so
+    /// backing out of a chat mid-reply and re-entering re-attaches to the same
+    /// in-flight stream instead of loading a blank (pre-persist) copy. Called
+    /// whenever `isStreaming` flips or the chat first gets an id.
+    var liveRegistrar: ((_ chatID: String, _ streaming: Bool) -> Void)?
+    private func syncLiveRegistration() {
+        if let id = chatID { liveRegistrar?(id, isStreaming) }
+    }
 
     private let client: OpenWebUIClient
     private let completions: ChatCompletionsClient
@@ -146,7 +155,10 @@ final class ChatViewModel: ObservableObject {
     /// Loads history once, in a Task owned by the view model (not a SwiftUI
     /// `.task`, which gets cancelled mid-navigation and blanks the messages).
     func loadHistoryIfNeeded() {
-        guard chatID != nil, !historyLoaded, historyTask == nil else { return }
+        // Skip while a reply is streaming: a re-attached live VM (re-entered mid-reply)
+        // carries the authoritative in-memory tree, and the server copy is still
+        // pre-persist (blank). Loading it here would clobber the live stream.
+        guard chatID != nil, !historyLoaded, historyTask == nil, !isStreaming else { return }
         runHistoryLoad()
     }
 
@@ -681,7 +693,7 @@ final class ChatViewModel: ObservableObject {
         if mode == .local {
             // On-device only — never touches the server/account database.
             let id = localStore.save(id: chatID, title: title, modelID: model, messages: messages)
-            if chatID == nil { chatID = id; self.title = title }
+            if chatID == nil { chatID = id; self.title = title; syncLiveRegistration() }
             onChanged?()
             return
         }
@@ -711,6 +723,7 @@ final class ChatViewModel: ObservableObject {
             let id = try await client.createChatTree(title: title, models: models,
                                                      tree: Array(tree.values), currentId: currentLeafId)
             chatID = id; self.title = title
+            syncLiveRegistration()   // now addressable by id → register the live stream
         }
         // Keep the offline cache in step with what we just wrote.
         if mode == .server, let id = chatID {

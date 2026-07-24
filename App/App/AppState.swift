@@ -243,7 +243,18 @@ final class AppState: ObservableObject {
 
     // Factories
     func makeChatStore() -> ChatStore { ChatStore(client: client, localStore: localStore) }
+
+    /// View models with a reply currently streaming, keyed by chat id. A ChatScreen
+    /// is destroyed when you navigate away, but its VM's stream keeps running; parking
+    /// it here keeps it alive and re-findable so re-entering the chat re-attaches to
+    /// the live stream instead of loading a blank (pre-persist) copy. Entries are
+    /// added when a stream starts (once the chat has an id) and removed when it ends.
+    private var liveChatVMs: [String: ChatViewModel] = [:]
+
     func makeChatViewModel(chat: OWChatSummary?, mode: ChatMode? = nil) -> ChatViewModel {
+        // Re-attach to an in-flight stream for this chat if one is parked — backing
+        // out mid-reply and coming back resumes the live stream (and its completion).
+        if let id = chat?.id, let live = liveChatVMs[id] { return live }
         // Existing chat: mode is fixed by where it lives (local vs server). New
         // chat: use the explicitly requested mode, else the user's default.
         let resolved: ChatMode = mode ?? (chat.map { $0.isLocal ? .local : .server } ?? preferredChatMode)
@@ -256,6 +267,14 @@ final class AppState: ObservableObject {
         // After each reply, learn durable facts about the user (background).
         vm.onReplyComplete = { [weak self] userText, replyText in
             self?.remember(userText: userText, replyText: replyText)
+        }
+        // Park while streaming / evict when done. Weak vm so the dictionary's entry
+        // is the only thing keeping a backgrounded stream alive; dropping it lets the
+        // VM deallocate once no on-screen ChatScreen holds it either.
+        vm.liveRegistrar = { [weak self, weak vm] id, streaming in
+            guard let self, let vm else { return }
+            if streaming { self.liveChatVMs[id] = vm }
+            else { self.liveChatVMs.removeValue(forKey: id) }
         }
         return vm
     }
